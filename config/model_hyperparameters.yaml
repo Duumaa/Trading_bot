@@ -1,0 +1,375 @@
+# =============================================================================
+# G10 Dominance — Model Hyperparameters
+# =============================================================================
+# All ML model configurations in one place.
+# Training scripts read from here; inference uses MLflow artifacts.
+# Override specific values via environment variables if needed.
+# =============================================================================
+
+# ── Analyst 1: LightGBM Regime Classifier ────────────────────────────────────
+analyst1_lightgbm:
+  model_name: "regime_classifier"
+  version: "v1.0"
+
+  # 4 regime classes
+  classes:
+    - TRENDING_HV       # Trending High Volatility
+    - TRENDING_LV       # Trending Low Volatility
+    - MEAN_REVERTING    # Range-bound / oscillating
+    - PRE_NEWS_STAGNATION  # Compression before high-impact event
+
+  # LightGBM params (tuned via Optuna)
+  lgbm_params:
+    objective: multiclass
+    num_class: 4
+    metric: multi_logloss
+    boosting_type: gbdt
+    n_estimators: 500
+    learning_rate: 0.05
+    max_depth: 6
+    num_leaves: 63
+    min_child_samples: 30
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    random_state: 42
+    n_jobs: -1
+    verbose: -1
+
+  # Optuna search space
+  optuna:
+    n_trials: 100
+    timeout_seconds: 3600
+    direction: minimize     # minimize multi_logloss
+    sampler: TPESampler
+    pruner: MedianPruner
+    search_space:
+      n_estimators: [100, 1000]
+      learning_rate: [0.01, 0.3]
+      max_depth: [3, 10]
+      num_leaves: [15, 255]
+      min_child_samples: [10, 100]
+      subsample: [0.5, 1.0]
+      colsample_bytree: [0.5, 1.0]
+      reg_alpha: [0.0, 1.0]
+      reg_lambda: [0.0, 1.0]
+
+  # Training
+  cv_folds: 5
+  cv_strategy: StratifiedKFold
+  early_stopping_rounds: 50
+  train_lookback_days: 365
+  min_confidence_threshold: 0.60   # below this → abstain
+
+  # Features used (subset of feature_vectors table)
+  features:
+    - yield_spread_2y_bps
+    - yield_spread_10y_bps
+    - yield_spread_zscore_5d
+    - yield_spread_zscore_20d
+    - atr_14
+    - atr_percentile_20d
+    - bid_ask_imbalance_1m
+    - hours_until_high_impact
+    - nc_net_pct_oi
+    - zscore_close_20d
+    - vpin
+
+
+# ── Analyst 2: Endogenous / Exogenous Score ───────────────────────────────────
+analyst2_endo_exo:
+  model_name: "endo_exo_score"
+  version: "v1.0"
+
+  # Score range: -1.0 (strong bearish) to +1.0 (strong bullish)
+  output_range: [-1.0, 1.0]
+
+  # Endogenous component weights (market-internal signals)
+  endogenous:
+    yield_momentum_weight: 0.35
+    cip_deviation_weight: 0.25
+    carry_zscore_weight: 0.20
+    yield_spread_zscore_weight: 0.20
+
+  # Exogenous component weights (external positioning signals)
+  exogenous:
+    cot_net_pct_weight: 0.40
+    cot_net_change_weight: 0.30
+    risk_reversal_weight: 0.30    # placeholder — requires vol surface data
+
+  # Blending
+  endo_weight: 0.60   # 60% endogenous
+  exo_weight: 0.40    # 40% exogenous
+
+  # Thresholds
+  min_score_abs: 0.30   # |score| must exceed this to generate a signal
+  lookback_days: 20
+
+
+# ── Analyst 3: Temporal Fusion Transformer (TFT) ─────────────────────────────
+analyst3_tft:
+  model_name: "tft_direction"
+  version: "v1.0"
+
+  # Architecture
+  architecture:
+    hidden_size: 128
+    lstm_layers: 2
+    num_attention_heads: 4
+    dropout: 0.1
+    hidden_continuous_size: 32
+
+  # Sequence
+  max_encoder_length: 96    # 96 x M15 = 24 hours lookback
+  max_prediction_length: 4  # predict 4 candles ahead (1 hour)
+
+  # Training (run on Kaggle GPU — export artifact for local inference)
+  training:
+    max_epochs: 50
+    batch_size: 64
+    learning_rate: 3.0e-4
+    gradient_clip_val: 0.1
+    reduce_on_plateau_patience: 5
+    accelerator: gpu          # change to cpu for local inference
+    devices: 1
+
+  # pytorch-forecasting TimeSeriesDataSet params
+  dataset:
+    time_idx: time_idx
+    target: close_return      # log return of close price
+    group_ids: [symbol]
+    min_encoder_length: 48
+    add_relative_time_idx: true
+    add_target_scales: true
+
+  # Inference (local CPU)
+  inference:
+    device: cpu
+    min_prob_threshold: 0.55  # directional confidence cutoff
+
+  # Features
+  time_varying_known_reals:
+    - hours_until_high_impact
+    - hour_of_day
+    - day_of_week
+  time_varying_unknown_reals:
+    - close_return
+    - atr_14
+    - bid_ask_imbalance_1m
+    - yield_spread_zscore_5d
+    - vwap_london
+    - volume
+
+
+# ── Analyst 4: PatchTSMixer + TCN (Two-Stage System) ─────────────────────────
+analyst4_tsmixer:
+  model_name: "tsmixer_tcn"
+  version: "v1.0"
+
+  # STAGE 1: LightGBM pair selector
+  stage1_lightgbm:
+    objective: binary
+    metric: auc
+    n_estimators: 300
+    learning_rate: 0.05
+    max_depth: 5
+    num_leaves: 31
+    subsample: 0.8
+    colsample_bytree: 0.8
+    random_state: 42
+    min_auc_threshold: 0.55   # CRITICAL: must exceed to pass to stage 2
+
+  # STAGE 2: PatchTSMixer directional confirmation
+  # CRITICAL: Stage 2 must NOT use any features from Stage 1 to prevent correlation
+  stage2_tsmixer:
+    # PatchTSMixer params
+    patch_len: 16            # patch size in time steps
+    stride: 8
+    d_model: 64
+    n_heads: 4
+    n_encoder_layers: 3
+    dropout: 0.1
+    sequence_length: 64      # 64 x M15 = 16 hours
+    prediction_length: 1     # binary: UP or DOWN
+
+    # TCN params (appended after TSMixer)
+    tcn_channels: [32, 64, 128]
+    tcn_kernel_size: 3
+    tcn_dropout: 0.1
+
+    # Training
+    max_epochs: 30
+    batch_size: 128
+    learning_rate: 1.0e-3
+    accelerator: gpu
+
+    # Stage 2 features (INDEPENDENT from Stage 1)
+    features:
+      - close_return
+      - high_low_range
+      - vwap_london
+      - volume
+      - atr_14
+      - price_vs_vwap_london
+
+    min_auc_threshold: 0.55  # Stage 2 independent check
+
+  # Anti-correlation guard
+  max_signal_correlation: 0.30   # |corr(stage1, stage2)| must be below this
+
+
+# ── Analyst 5: Daily Groq Sentiment ──────────────────────────────────────────
+analyst5_groq:
+  model_name: "groq_daily_sentiment"
+  version: "v1.0"
+
+  # API settings
+  model: "llama3-70b-8192"
+  max_tokens: 500
+  temperature: 0.1    # low for consistent structured output
+
+  # Only process HIGH impact news
+  min_impact_level: HIGH
+
+  # Categorization prompt schema (returned as JSON)
+  output_schema:
+    score: float          # -1.0 to +1.0
+    confidence: float     # 0.0 to 1.0
+    currencies: list      # affected currency codes
+    stance: str           # Hawkish / Dovish / Risk-On / Risk-Off / Neutral
+    key_themes: list      # top 3 themes
+
+  # Score thresholds
+  min_score_abs: 0.20     # filter noise
+  min_confidence: 0.60
+
+  # Cache settings
+  cache_ttl_hours: 24     # score valid for 1 trading day
+  scrape_interval_minutes: 15
+
+
+# ── Analyst 6: Weekly Claude Opus Deep Analysis ───────────────────────────────
+analyst6_opus:
+  model_name: "opus_weekly_analysis"
+  version: "v1.0"
+
+  # API settings
+  model: "claude-opus-4-5"
+  max_tokens: 4000
+  temperature: 0.2
+
+  # Multi-agent structure
+  agents:
+    hawk:
+      bias: +0.7
+      weight: 0.30
+      focus: "inflation risks, policy tightening, currency strength"
+    dove:
+      bias: -0.7
+      weight: 0.30
+      focus: "growth risks, policy easing, currency weakness"
+    strategist:
+      bias: 0.0
+      weight: 0.40
+      focus: "market pricing, OIS divergence, positioning extremes"
+
+  # IMF framework metrics
+  imf_framework:
+    nps:              # Narrative Policy Score
+      range: [-1.0, 1.0]
+    straightforwardness:  # Communication clarity index
+      range: [0.0, 1.0]
+    ois_divergence:   # Narrative vs market pricing gap
+      range: [-2.0, 2.0]
+
+  # Output per currency
+  output_per_currency:
+    macro_bias: float         # -1.0 to +1.0
+    confidence: float         # 0.0 to 1.0
+    policy_stance: str        # Hawkish/Dovish/Neutral/On-Hold
+    nps: float
+    ois_divergence: float
+    key_risks: list
+    valid_until: datetime     # next Sunday
+
+  # Schedule
+  run_day: Sunday
+  run_hour_utc: 20            # 8 PM UTC (before Asian open)
+  cache_ttl_days: 7
+
+
+# ── PPO Reinforcement Learning Agent ─────────────────────────────────────────
+rl_ppo:
+  model_name: "ppo_position_sizer"
+  version: "v1.0"
+
+  # Environment
+  env:
+    lookback_steps: 96            # feature history provided to policy
+    max_position_size: 0.02       # 2% max risk per trade
+    reward_scale: 100.0
+
+  # PPO hyperparameters (stable-baselines3)
+  ppo_params:
+    learning_rate: 3.0e-4
+    n_steps: 2048
+    batch_size: 64
+    n_epochs: 10
+    gamma: 0.99
+    gae_lambda: 0.95
+    clip_range: 0.2
+    ent_coef: 0.01
+    vf_coef: 0.5
+    max_grad_norm: 0.5
+    total_timesteps: 1_000_000
+
+  # Reward function
+  reward:
+    pnl_weight: 1.0
+    loss_aversion_multiplier: 2.5   # asymmetric: losses penalised 2.5x
+    drawdown_penalty: 0.5
+    missed_crash_penalty: 1.5       # false negative penalty
+
+  # Policy network
+  policy: MlpPolicy
+  policy_kwargs:
+    net_arch: [256, 256, 128]
+    activation_fn: ReLU
+
+
+# ── Drift Detection ───────────────────────────────────────────────────────────
+drift_detection:
+  # Population Stability Index
+  psi_threshold: 0.25           # PSI > 0.25 → significant drift
+  psi_warning_threshold: 0.10   # PSI > 0.10 → warning
+
+  # Kolmogorov-Smirnov test
+  ks_pvalue_threshold: 0.05     # p < 0.05 → distribution shift
+
+  # Monitoring window
+  reference_window_days: 90
+  check_interval_hours: 24
+
+  # Features to monitor
+  monitored_features:
+    - yield_spread_2y_bps
+    - bid_ask_imbalance_1m
+    - atr_percentile_20d
+    - vpin
+    - hours_until_high_impact
+
+
+# ── Retraining Schedule ───────────────────────────────────────────────────────
+retraining:
+  schedule: monthly             # monthly retraining loop
+  day_of_month: 1               # 1st of each month
+  hour_utc: 2                   # 2 AM UTC
+
+  # A/B testing
+  ab_test_days: 14              # run challenger for 14 days
+  min_improvement_pct: 5.0      # champion replaced only if >5% better
+
+  # Data requirements
+  min_training_samples: 5000
+  train_val_split: 0.8

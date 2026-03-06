@@ -1,0 +1,14 @@
+fix:
+  symbol_map:
+    EURUSD: 1
+    GBPUSD: 2
+    EURJPY: 3
+    USDJPY: 4
+    AUDUSD: 5
+    USDCHF: 6
+    GBPJPY: 7
+    USDCAD: 8
+    EURGBP: 9
+    AUDJPY: 11
+    NZDUSD: 12
+    NZDJPY: 21

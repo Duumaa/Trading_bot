@@ -998,6 +998,8 @@ class RiskManager:
         try:
             self.r.set("risk:halted", "true")
             self.r.set("risk:halt_reason", reason)
+            from intelligence.monitoring.telegram_alerts import alerts
+            alerts.send_kill_switch(daily_pnl_pct=0.0, reason=reason)
             logger.critical(
                 f"RiskManager | ⛔ TRADING HALTED: {reason}"
             )

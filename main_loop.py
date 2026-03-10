@@ -63,6 +63,7 @@ from typing import Dict, List, Optional
 
 from loguru import logger
 from dotenv import load_dotenv
+from intelligence.monitoring.telegram_alerts import alerts
 
 ROOT = Path("/workspaces/Trading_bot")
 sys.path.insert(0, str(ROOT))
@@ -389,7 +390,7 @@ def _start_background_threads(dry_run: bool) -> None:
     def _stream_thread():
         try:
             from data_pipeline.connectors.ctrader_live_stream import live_stream
-            live_stream.start()
+            live_stream.connect()
             logger.info("MainLoop | Live stream started")
         except Exception as exc:
             logger.warning(f"MainLoop | Live stream failed: {exc}")
@@ -401,7 +402,7 @@ def _start_background_threads(dry_run: bool) -> None:
             try:
                 # News scraper
                 from data_pipeline.connectors.rss_news_scraper import news_scraper
-                news_scraper.scrape_all()
+                news_scraper.fetch_all()
             except Exception as exc:
                 logger.debug(f"MainLoop | News scrape: {exc}")
 
@@ -416,7 +417,7 @@ def _start_background_threads(dry_run: bool) -> None:
             try:
                 # Yield scraper
                 from data_pipeline.connectors.yield_scraper import yield_scraper
-                yield_scraper.scrape_all()
+                yield_scraper.fetch_latest()
             except Exception as exc:
                 logger.debug(f"MainLoop | Yield scrape: {exc}")
 
@@ -507,6 +508,12 @@ def _start_background_threads(dry_run: bool) -> None:
     # Stream thread only when market open
     if _is_market_open():
         threads.insert(0, ("live-stream", _stream_thread))
+        # FIX tick collector — runs alongside live stream for L2 data
+        try:
+            from data_pipeline.connectors.ctrader_fix import fix_collector
+            threads.insert(1, ("fix-collector", fix_collector.start))
+        except Exception as exc:
+            logger.warning(f"MainLoop | FIX collector unavailable: {exc}")
 
     for name, target in threads:
         t = threading.Thread(target=target, daemon=True, name=name)
@@ -559,6 +566,7 @@ def _graceful_shutdown() -> None:
     except Exception as exc:
         logger.error(f"MainLoop | Shutdown error: {exc}")
 
+    alerts.send_shutdown(reason="Graceful shutdown")
     logger.success("MainLoop | Shutdown complete")
 
 
@@ -618,6 +626,7 @@ def main(dry_run: bool = False, status_only: bool = False) -> None:
             balance = account_info.get("balance", 10_000.0)
             equity  = account_info.get("equity",  balance)
             risk_manager.account.update(balance, equity)
+            alerts.send_startup(mode="PAPER", balance=balance)
             logger.success(
                 f"MainLoop | Account: ${balance:,.2f} "
                 f"equity=${equity:,.2f}"

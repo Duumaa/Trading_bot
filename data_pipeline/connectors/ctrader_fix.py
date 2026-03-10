@@ -239,7 +239,7 @@ class FIXTickCollector:
     def _on_message(self, client: Any, message: Any) -> None:
         """Route all incoming FIX messages."""
         try:
-            logger.debug(f"FIX RAW: {message.getMessage()[:200]}")
+            pass  # FIX RAW logging disabled in production
             msg_type = message.getFieldValue(35)
 
             if msg_type == MSG_LOGON:

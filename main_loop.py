@@ -507,11 +507,11 @@ def _start_background_threads(dry_run: bool) -> None:
 
     # Stream thread only when market open
     if _is_market_open():
-        threads.insert(0, ("live-stream", _stream_thread))
-        # FIX tick collector — runs alongside live stream for L2 data
+        # FIX collector is the sole tick source — handles ticks + L2 order book
+        # Live stream disabled: conflicts with REST API (ALREADY_LOGGED_IN)
         try:
             from data_pipeline.connectors.ctrader_fix import fix_collector
-            threads.insert(1, ("fix-collector", fix_collector.start))
+            threads.insert(0, ("fix-collector", fix_collector.start))
         except Exception as exc:
             logger.warning(f"MainLoop | FIX collector unavailable: {exc}")
 

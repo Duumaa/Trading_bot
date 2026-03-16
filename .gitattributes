@@ -1,0 +1,6 @@
+*.pkl binary
+*.txt binary
+*.pt binary
+*.h5 binary
+*.npy binary
+*.npz binary

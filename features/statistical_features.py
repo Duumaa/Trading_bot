@@ -55,7 +55,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import redis
+
 from dotenv import load_dotenv
 from loguru import logger
 from sqlalchemy import text
@@ -122,14 +122,9 @@ class StatisticalFeatureEngine:
 
     @property
     def redis(self) -> redis.Redis:
-        """Lazy Redis connection with password auth."""
         if self._redis is None:
-            self._redis = redis.Redis(
-                host=os.getenv("REDIS_HOST", "localhost"),
-                port=int(os.getenv("REDIS_PORT", "6379")),
-                password=os.getenv("REDIS_PASSWORD") or None,
-                decode_responses=True,
-            )
+            from data_pipeline.storage.redis_pool import redis_client
+            self._redis = redis_client
         return self._redis
 
     def _redis_get(self, key: str) -> Optional[Dict[str, float]]:
@@ -206,6 +201,42 @@ class StatisticalFeatureEngine:
         return results
 
     # ── Data loading ──────────────────────────────────────────────────────────
+
+    def _compute_m15_atr(self, pair: str, period: int = 14) -> float:
+        """
+        Compute ATR_14 directly on M15 bars (not resampled to D1).
+        This is the correct stop-loss sizing ATR for an M15 trading system.
+        Returns ATR in price units (already JPY-corrected).
+        """
+        try:
+            query = text("""
+                SELECT time, high, low, close
+                FROM ohlcv
+                WHERE symbol    = :symbol
+                  AND timeframe = 'M15'
+                  AND time      >= NOW() - INTERVAL '7 days'
+                ORDER BY time ASC
+            """)
+            with db.connection() as conn:
+                rows = conn.execute(query, {"symbol": pair}).fetchall()
+
+            if len(rows) < period + 1:
+                return 0.0
+
+            df = pd.DataFrame(rows, columns=["time", "high", "low", "close"])
+            df = df.astype({"high": float, "low": float, "close": float})
+
+            # JPY correction
+            if pair in JPY_PAIRS:
+                for col in ["high", "low", "close"]:
+                    df[col] = df[col] / 100.0
+
+            tr = self._true_range(df)
+            atr = self._wilder_smooth(tr, period=period).iloc[-1]
+            return float(atr)
+        except Exception as exc:
+            logger.debug(f"StatEngine | M15 ATR failed {pair}: {exc}")
+            return 0.0
 
     def _load_daily_ohlcv(self, pair: str) -> Optional[pd.DataFrame]:
         """
@@ -291,6 +322,9 @@ class StatisticalFeatureEngine:
         feats["atr_14"] = round(float(atr_14), 6)
         feats["atr_pct"] = round(float(atr_14 / df["close"].iloc[-1]), 6)
         feats["atr_ratio"] = round(float(atr_14 / atr_50) if atr_50 > 0 else 1.0, 6)
+        # M15 ATR — computed separately, used by risk manager for stop sizing
+        # This is the correct ATR for an M15 trading system (not D1)
+        feats["atr_14_m15"] = round(float(self._compute_m15_atr(pair)), 6)
 
         # ── Rolling volatility features ───────────────────────────────────────
         # Log returns are additive and better behaved than simple returns

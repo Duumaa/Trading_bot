@@ -58,7 +58,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import redis
+
 from dotenv import load_dotenv
 from loguru import logger
 from sqlalchemy import text
@@ -125,14 +125,9 @@ class VWAPFeatureEngine:
 
     @property
     def redis(self) -> redis.Redis:
-        """Lazy Redis connection with password auth."""
         if self._redis is None:
-            self._redis = redis.Redis(
-                host=os.getenv("REDIS_HOST", "localhost"),
-                port=int(os.getenv("REDIS_PORT", "6379")),
-                password=os.getenv("REDIS_PASSWORD") or None,
-                decode_responses=True,
-            )
+            from data_pipeline.storage.redis_pool import redis_client
+            self._redis = redis_client
         return self._redis
 
     def _redis_get(self, key: str) -> Optional[Dict[str, float]]:

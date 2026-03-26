@@ -99,6 +99,9 @@ class CTraderOpenAPIConnector:
 
         # Symbol cache
         self._symbol_map: Dict[str, int] = {}
+        self._tick_buffer: List[Dict] = []
+        self._tick_buffer_lock = threading.Lock()
+        self._last_tick_flush = time.time()
 
         # Rate limiting
         self._last_hist_request: float = 0.0
@@ -222,6 +225,10 @@ class CTraderOpenAPIConnector:
         )
         from ctrader_open_api.messages.OpenApiMessages_pb2 import (
             ProtoOAErrorRes,
+            ProtoOAOrderErrorEvent,
+            ProtoOAExecutionEvent,
+            ProtoOASpotEvent,
+            ProtoOADepthEvent,
         )
         
 
@@ -252,8 +259,261 @@ class CTraderOpenAPIConnector:
                 self._last_response = msg
                 self._response_event.set()
 
+        elif isinstance(msg, ProtoOAOrderErrorEvent):
+            logger.error(
+                f"OrderError | code={msg.errorCode} | "
+                f"desc={getattr(msg, 'description', '?')} | "
+                f"orderId={getattr(msg, 'clientOrderId', '?')}"
+            )
+            with self._response_lock:
+                self._last_response = msg
+                self._response_event.set()
+        elif isinstance(msg, ProtoOAExecutionEvent):
+            logger.success(
+                f"Execution | type={msg.executionType} | "
+                f"pos={getattr(msg.position, 'positionId', '?')} | "
+                f"price={getattr(msg.position, 'price', '?')}"
+            )
+            with self._response_lock:
+                self._last_response = msg
+                self._response_event.set()
+        elif isinstance(msg, ProtoOASpotEvent):
+            self._handle_spot_event(msg)
+        elif isinstance(msg, ProtoOADepthEvent):
+            self._handle_depth_event(msg)
         else:
             logger.debug(f"Unhandled: {type(msg).__name__}")
+
+    # =========================================================================
+    # Live price + depth subscription (piggybacks on existing auth)
+    # =========================================================================
+
+    def subscribe_spots(self, pairs: List[str]) -> None:
+        """
+        Subscribe to real-time spot prices for given pairs.
+        Reuses existing authenticated connection — no separate auth needed.
+        Results stored in Redis: tick:{PAIR} and orderbook:{PAIR}
+        """
+        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+            ProtoOASubscribeSpotsReq,
+        )
+        import redis as redis_lib
+        import os
+
+        if not self._account_authed.is_set():
+            logger.warning("REST API | Cannot subscribe — not authenticated")
+            return
+
+        symbol_map = self.load_symbols()
+        subscribed = []
+
+        for pair in pairs:
+            sid = symbol_map.get(pair)
+            if not sid:
+                logger.warning(f"REST API | Unknown symbol: {pair}")
+                continue
+            try:
+                req = ProtoOASubscribeSpotsReq()
+                req.ctidTraderAccountId = int(_get("CTRADER_ACCOUNT_ID"))
+                req.symbolId.append(sid)
+                req.subscribeToSpotTimestamp = True
+                from twisted.internet import reactor
+                reactor.callFromThread(self._client.send, req)
+                subscribed.append(pair)
+            except Exception as exc:
+                logger.error(f"REST API | Subscribe {pair} failed: {exc}")
+
+        if subscribed:
+            logger.success(f"REST API | Subscribed to spots: {subscribed}")
+
+        # Also subscribe to L2 depth quotes
+        try:
+            from ctrader_open_api.messages.OpenApiMessages_pb2 import (
+                ProtoOASubscribeDepthQuotesReq,
+            )
+            for pair in pairs:
+                sid = symbol_map.get(pair)
+                if not sid:
+                    continue
+                req = ProtoOASubscribeDepthQuotesReq()
+                req.ctidTraderAccountId = int(_get("CTRADER_ACCOUNT_ID"))
+                req.symbolId.append(sid)
+                from twisted.internet import reactor
+                reactor.callFromThread(self._client.send, req)
+            logger.success(f"REST API | Subscribed to L2 depth for {len(pairs)} pairs")
+        except Exception as exc:
+            logger.warning(f"REST API | Depth subscription failed: {exc}")
+
+    def _handle_spot_event(self, msg: Any) -> None:
+        """Handle incoming spot price event — cache to Redis."""
+        try:
+            import redis as redis_lib, os, json
+            from datetime import datetime, timezone
+
+            r = redis_lib.Redis(
+                host=os.getenv("REDIS_HOST", "localhost"),
+                port=int(os.getenv("REDIS_PORT", "6379")),
+                password=os.getenv("REDIS_PASSWORD") or None,
+                decode_responses=True,
+            )
+
+            symbol_map = self.load_symbols()
+            rev_map    = {v: k for k, v in symbol_map.items()}
+            pair       = rev_map.get(msg.symbolId, f"SYM_{msg.symbolId}")
+
+            # cTrader sends prices as integers (price * 100000)
+            # cTrader: non-JPY = price × 100000, JPY = price × 1000
+            JPY_PAIRS = {"USDJPY","EURJPY","GBPJPY","AUDJPY","NZDJPY"}
+            # cTrader spot event scaling:
+            # Non-JPY: raw / 100000 → correct price
+            # JPY:     raw / 1000   → correct price
+            # DEBUG — log raw integer before division
+            # cTrader OpenAPI: all pairs use 100000 divisor (5 decimal places)
+            divisor = 100000.0
+            bid = msg.bid / divisor if msg.HasField("bid") else 0.0
+            ask = msg.ask / divisor if msg.HasField("ask") else 0.0
+
+            if bid <= 0 or ask <= 0:
+                return
+
+            now = datetime.now(timezone.utc)
+            tick = {
+                "bid":    round(bid, 6),
+                "ask":    round(ask, 6),
+                "mid":    round((bid + ask) / 2, 6),
+                "spread": round(ask - bid, 6),
+                "time":   now.isoformat(),
+            }
+            r.set(f"tick:{pair}", json.dumps(tick), ex=60)
+
+            # Store to DB ticks table (batch via Redis list)
+            # Batch tick to buffer — flush every 100 ticks or 10 seconds
+            with self._tick_buffer_lock:
+                self._tick_buffer.append({
+                    "sym": pair,
+                    "ts":  now,
+                    "bid": round(bid, 6),
+                    "ask": round(ask, 6),
+                })
+                should_flush = (
+                    len(self._tick_buffer) >= 100 or
+                    time.time() - self._last_tick_flush >= 10
+                )
+
+            if should_flush:
+                self._flush_tick_buffer()
+
+        except Exception as exc:
+            logger.debug(f"REST API | Spot event failed: {exc}")
+    
+    def _flush_tick_buffer(self) -> None:
+        """Flush tick buffer to DB in one batch INSERT."""
+        with self._tick_buffer_lock:
+            if not self._tick_buffer:
+                return
+            batch = self._tick_buffer.copy()
+            self._tick_buffer.clear()
+            self._last_tick_flush = time.time()
+
+        try:
+            from data_pipeline.storage.timeseries_db import db
+            from sqlalchemy import text as sa_text
+            with db.connection() as conn:
+                rows = [{"sym": t["sym"],
+                         "ts":  t["ts"].isoformat() if hasattr(t["ts"], "isoformat") else str(t["ts"]),
+                         "bid": t["bid"],
+                         "ask": t["ask"]}
+                        for t in batch]
+                conn.execute(sa_text("""
+                    INSERT INTO ticks (symbol, time, bid, ask)
+                    VALUES (:sym, :ts, :bid, :ask)
+                    ON CONFLICT (symbol, time) DO NOTHING
+                """), rows)
+                conn.commit()
+            logger.debug(f"REST API | Flushed {len(batch)} ticks to DB")
+        except Exception as exc:
+            logger.debug(f"REST API | Tick flush failed: {exc}")
+
+    def _handle_depth_event(self, msg: Any) -> None:
+        """Handle incoming L2 depth event — cache to Redis."""
+        try:
+            import redis as redis_lib, os, json
+            from datetime import datetime, timezone
+
+            r = redis_lib.Redis(
+                host=os.getenv("REDIS_HOST", "localhost"),
+                port=int(os.getenv("REDIS_PORT", "6379")),
+                password=os.getenv("REDIS_PASSWORD") or None,
+                decode_responses=True,
+            )
+
+            symbol_map = self.load_symbols()
+            rev_map    = {v: k for k, v in symbol_map.items()}
+            pair       = rev_map.get(msg.symbolId, f"SYM_{msg.symbolId}")
+
+            divisor = 100000.0
+            bids, asks = [], []
+
+            for entry in msg.newQuotes:
+                size = entry.size if entry.HasField("size") else 0.0
+                bid  = entry.bid / divisor if entry.HasField("bid") else 0.0
+                ask  = entry.ask / divisor if entry.HasField("ask") else 0.0
+                if bid > 0:
+                    bids.append({"price": round(bid, 6), "size": size})
+                if ask > 0:
+                    asks.append({"price": round(ask, 6), "size": size})
+
+            bids.sort(key=lambda x: x["price"], reverse=True)
+            asks.sort(key=lambda x: x["price"])
+
+            book = {
+                "bids": bids[:20],
+                "asks": asks[:20],
+                "time": datetime.now(timezone.utc).isoformat(),
+            }
+            r.set(f"orderbook:{pair}", json.dumps(book), ex=60)
+
+            # Store snapshot to DB for MMM model training
+            try:
+                from data_pipeline.storage.timeseries_db import db
+                from sqlalchemy import text as sa_text
+                import json as _json
+
+                total_bid_vol = sum(b["size"] for b in bids)
+                total_ask_vol = sum(a["size"] for a in asks)
+                imbalance = (
+                    (total_bid_vol - total_ask_vol) /
+                    (total_bid_vol + total_ask_vol)
+                    if (total_bid_vol + total_ask_vol) > 0 else 0.0
+                )
+
+                with db.connection() as conn:
+                    conn.execute(sa_text("""
+                        INSERT INTO order_book_snapshots
+                            (time, symbol, bids, asks,
+                             bid_ask_imbalance, total_bid_volume,
+                             total_ask_volume, depth_levels)
+                        VALUES
+                            (:ts, :sym, :bids, :asks,
+                             :imbalance, :bid_vol,
+                             :ask_vol, :levels)
+                        ON CONFLICT DO NOTHING
+                    """), {
+                        "ts":        datetime.now(timezone.utc).isoformat(),
+                        "sym":       pair,
+                        "bids":      _json.dumps(bids[:20]),
+                        "asks":      _json.dumps(asks[:20]),
+                        "imbalance": round(imbalance, 6),
+                        "bid_vol":   total_bid_vol,
+                        "ask_vol":   total_ask_vol,
+                        "levels":    min(len(bids), len(asks), 20),
+                    })
+                    conn.commit()
+            except Exception as db_exc:
+                logger.debug(f"REST API | Depth DB store failed: {db_exc}")
+
+        except Exception as exc:
+            logger.debug(f"REST API | Depth event failed: {exc}")
 
     # =========================================================================
     # Auth senders (called from reactor thread)
@@ -317,6 +577,9 @@ class CTraderOpenAPIConnector:
 
     def load_symbols(self) -> Dict[str, int]:
         """Load symbol name → ID map from ctrader_config.yaml."""
+        """Load symbol name → ID map from ctrader_config.yaml."""
+        if self._symbol_map:          # ← ADD THIS LINE
+            return self._symbol_map   # ← AND THIS LINE
         import yaml
         from pathlib import Path
 

@@ -1,0 +1,55 @@
+{
+  "patch_tsmixer_threshold": 0.55,
+  "tcn_threshold": 0.55,
+  "patch_tsmixer_auc": 0.719,
+  "tcn_auc": 0.7366,
+  "agree_mode": "co_gate",
+  "horizon_bars": 8,
+  "seq_len": 96,
+  "n_features": 16,
+  "patch_params": {
+    "patch_size": 4,
+    "patch_dim": 32,
+    "n_layers": 2,
+    "dropout": 0.2197
+  },
+  "tcn_params": {
+    "n_channels": 64,
+    "n_levels": 4,
+    "dropout": 0.0864
+  },
+  "trained_date": "2026-03-16",
+  "train_period": "2008\u20132022",
+  "val_period": "2023",
+  "test_period": "2024\u20132026",
+  "regime_performance": {
+    "THV": {
+      "count": 82575,
+      "patch_auc": 0.6406,
+      "tcn_auc": 0.6622,
+      "combined_precision": 0.6575,
+      "coverage": 0.7362
+    },
+    "TLV": {
+      "count": 87376,
+      "patch_auc": 0.6109,
+      "tcn_auc": 0.6211,
+      "combined_precision": 0.6233,
+      "coverage": 0.6322
+    },
+    "MR": {
+      "count": 275199,
+      "patch_auc": 0.6557,
+      "tcn_auc": 0.6688,
+      "combined_precision": 0.6618,
+      "coverage": 0.7444
+    },
+    "PNS": {
+      "count": 29571,
+      "patch_auc": 0.5866,
+      "tcn_auc": 0.5924,
+      "combined_precision": 0.6001,
+      "coverage": 0.5873
+    }
+  }
+}

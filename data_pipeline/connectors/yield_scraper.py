@@ -225,25 +225,61 @@ class YieldScraper:
             start_boe = "01/Jan/2020"
             end_boe   = datetime.now(UTC).strftime("%d/%b/%Y")
 
-        params = {
-            "SeriesCodes": series_id, "CSVF": "TN", "UsingCodes": "Y",
-            "DAT": "RNG", "FD": start_boe, "TD": end_boe,
-            "VPD": "Y", "C": series_id,
-        }
+        # BoE changed API in 2025 — new CSV endpoint requires csv.x=yes param
+        # Old endpoint returns HTML page, new one returns application/csv directly
+        BOE_CSV_URL = (
+            "https://www.bankofengland.co.uk/boeapps/iadb/fromshowcolumns.asp"
+            f"?csv.x=yes&Datefrom={start_boe}&Dateto={end_boe}"
+            f"&SeriesCodes={series_id}&CSVF=TN&UsingCodes=Y"
+        )
         try:
-            resp = self._session.get(BOE_BASE, params=params, timeout=30)
+            resp = self._session.get(
+                BOE_CSV_URL,
+                timeout=30,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "text/csv,text/plain,*/*",
+                    "Referer": "https://www.bankofengland.co.uk/",
+                },
+            )
             resp.raise_for_status()
+
+            # Response format: "08 Jan 2024,5.25UDBEDR" per line
+            # Strip the series code suffix that appears on first line
+            lines = resp.text.strip().splitlines()
+            clean_lines = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                # Strip series code suffix if present (e.g. "5.25IUDBEDR")
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    val = parts[1]
+                    # Remove any trailing non-numeric chars (series code)
+                    import re
+                    val = re.sub(r"[A-Za-z]+$", "", val).strip()
+                    clean_lines.append(f"{parts[0]},{val}")
+
+            clean_csv = "\n".join(clean_lines)
             df = pd.read_csv(
-                io.StringIO(resp.text), skiprows=1, header=0,
+                io.StringIO(clean_csv),
+                header=None,
                 names=["date", "value"],
-            ).dropna()
-            df["date"]  = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+            )
+            df["date"]  = pd.to_datetime(df["date"], format="%d %b %Y",
+                                          errors="coerce")
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
-            df = df.dropna()
-            s  = df.set_index("date")["value"].sort_index()
-            s  = s.reindex(pd.date_range(s.index[0], s.index[-1], freq="D")).ffill()
+            df = df.dropna().set_index("date").sort_index()
+
+            s = df["value"]
+            s = s.reindex(
+                pd.date_range(s.index[0], s.index[-1], freq="D")
+            ).ffill()
+
             logger.debug(f"BoE [{key}]: {len(s)} daily obs")
             return s
+
         except Exception as exc:
             logger.error(f"BoE [{key}]: {exc}")
             return pd.Series(dtype=float)

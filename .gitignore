@@ -1,3 +1,22 @@
 .env__pycache__/
 *.pyc
 *.save
+# Environment
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor backups
+*.save.*
+*.bak
+
+# Logs
+*.log
+logs/
+
+# Large data files (keep models, exclude data)
+*.csv
+*.zip

@@ -1,0 +1,18 @@
+[
+  "f_return",
+  "f_atr_pct",
+  "f_vol_ratio",
+  "f_rsi",
+  "f_ema_slope",
+  "f_price_vs_ema50",
+  "f_price_vs_ema200",
+  "f_momentum_8",
+  "f_momentum_32",
+  "f_bb_width",
+  "f_adx",
+  "f_higher_highs",
+  "f_hl_range_pct",
+  "f_vwap_dist",
+  "f_body_ratio",
+  "f_wick_ratio"
+]

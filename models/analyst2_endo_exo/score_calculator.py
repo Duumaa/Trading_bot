@@ -85,6 +85,7 @@ ROOT = Path("/workspaces/Trading_bot")
 sys.path.insert(0, str(ROOT))
 
 from data_pipeline.storage.timeseries_db import db  # noqa: E402
+from models.analyst2_endo_exo.macro_scorer import macro_scorer as _macro_scorer
 
 # ══════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -126,10 +127,11 @@ COMMODITY_LINKS: Dict[str, Tuple[str, float]] = {
 
 # Driver weights — must sum to 1.0
 WEIGHTS = {
-    "yield":     0.35,
-    "cot":       0.30,
-    "carry":     0.20,
-    "commodity": 0.15,
+    "yield":     0.30,
+    "cot":       0.25,
+    "carry":     0.15,
+    "commodity": 0.10,
+    "endo":      0.20,
 }
 
 # Thresholds
@@ -341,15 +343,27 @@ def _score_yield(pair: str, base: str, quote: str) -> Tuple[float, bool]:
     combined_2y  = score_2y_raw * 0.50 + nonlin_2y * 0.50
 
     # Momentum: direction of trend, not magnitude
+
     mom_2y = (
         np.sign(trend_4w_2y)  * 0.60 +
         np.sign(trend_13w_2y) * 0.40
-    ) * 0.40   # momentum max contribution: ±0.40
+    ) * 0.40
 
+    # Course principle: "Direction matters more than absolute level"
+    # When ALL trend signals oppose the absolute spread → compress conviction
+    # This prevents a wide-but-compressing spread from generating false confidence
+    trend_4w_2y_sig  = trend_4w_2y  if abs(trend_4w_2y)  > 0.02 else 0.0
+    trend_13w_2y_sig = trend_13w_2y if abs(trend_13w_2y) > 0.02 else 0.0
+    _2y_level = np.sign(combined_2y)
+    _2y_trends_sig = [trend_4w_2y_sig, trend_13w_2y_sig]
+    _2y_opposing = sum(1 for t in _2y_trends_sig
+                       if t != 0 and np.sign(t) != _2y_level)
+    _2y_nonzero  = sum(1 for t in _2y_trends_sig if t != 0)
+    if abs(combined_2y) > 0.25 and _2y_nonzero > 0 and _2y_opposing >= _2y_nonzero * 0.5:
+        combined_2y *= 0.35
     z2y_score  = np.clip(zscore_2y / 3.0, -0.30, 0.30)
-    tenor_2y   = float(np.clip(combined_2y * 0.60 + mom_2y * 0.25 + z2y_score * 0.15,
+    tenor_2y   = float(np.clip(combined_2y * 0.60 + mom_2y * 0.35 + z2y_score * 0.15,
                                -1.0, 1.0))
-
     # ── 10Y component (60% weight) ────────────────────────────
     diff_10y      = feats.get("yield_diff_10Y", 0.0)
     score_10y_raw = feats.get("yield_score_10Y", 0.0)
@@ -365,8 +379,36 @@ def _score_yield(pair: str, base: str, quote: str) -> Tuple[float, bool]:
         np.sign(trend_13w_10y) * 0.40
     ) * 0.40
 
+    # Compression override: 10Y is primary carry tenor — even more important
+    # that compressing spreads reduce conviction
+    # Dead zone: treat |trend| < 0.02 as noise, not signal
+    trend_4w_10y_sig  = trend_4w_10y  if abs(trend_4w_10y)  > 0.02 else 0.0
+    trend_13w_10y_sig = trend_13w_10y if abs(trend_13w_10y) > 0.02 else 0.0
+    _10y_level = np.sign(combined_10y)
+
+    # Count how many non-noise trends oppose the absolute level
+    _10y_trends_sig = [trend_4w_10y_sig, trend_13w_10y_sig]
+    _opposing = sum(1 for t in _10y_trends_sig
+                    if t != 0 and np.sign(t) != _10y_level)
+    _nonzero  = sum(1 for t in _10y_trends_sig if t != 0)
+
+    _momentum_10y = feats.get("yield_momentum_10Y", 0.0)
+    _momentum_agrees_compression = (
+        abs(_momentum_10y) > 0.02 and
+        np.sign(_momentum_10y) != _10y_level
+    )
+
+    # Compress when MAJORITY of non-noise trends oppose the level
+    # NZDJPY example: 4w=+0.005(noise→0), 13w=-0.130(opposes) → 1/1 = 100% opposing
+    if abs(combined_10y) > 0.25 and _nonzero > 0 and _opposing >= _nonzero * 0.5:
+        compression = 0.30 if _momentum_agrees_compression else 0.45
+        combined_10y *= compression
+        logger.debug(
+            f"  yield compress 10Y: {_opposing}/{_nonzero} trends oppose "
+            f"level={_10y_level:+.0f} → x{compression}"
+        )
     z10y_score  = np.clip(zscore_10y / 3.0, -0.30, 0.30)
-    tenor_10y   = float(np.clip(combined_10y * 0.60 + mom_10y * 0.25 + z10y_score * 0.15,
+    tenor_10y   = float(np.clip(combined_10y * 0.60 + mom_10y * 0.35 + z10y_score * 0.15,
                                 -1.0, 1.0))
 
     # ── Auxiliary signals ─────────────────────────────────────
@@ -477,8 +519,7 @@ def _score_carry(base: str, quote: str) -> Tuple[float, bool]:
     quote_rank = CARRY_RANK.get(quote, 4)
     # Lower rank = higher yield. Score: positive if base higher yielding.
     rank_diff  = quote_rank - base_rank   # positive = base higher yielding
-    rank_score = np.clip(rank_diff / 4.0, -1.0, 1.0)
-
+    rank_score = np.clip(rank_diff / 7.0, -1.0, 1.0)
     # Dynamic 10Y yield differential from DB
     base_yield_df  = _load_yield_history(base,  "10Y", days=30)
     quote_yield_df = _load_yield_history(quote, "10Y", days=30)
@@ -496,9 +537,60 @@ def _score_carry(base: str, quote: str) -> Tuple[float, bool]:
         dynamic_score = 0.0
 
     # Blend static rank + dynamic yield gap
+    # Course principle: compressing carry differential = deteriorating trade
+    # Check if the yield gap itself is trending against current level
+    if data_valid:
+        try:
+            base_hist  = _load_yield_history(base,  "10Y", days=100)
+            quote_hist = _load_yield_history(quote, "10Y", days=100)
+
+            if len(base_hist) >= 2 and len(quote_hist) >= 2:
+                # Date-based lookback — works for both daily AND monthly data
+                # Monthly OECD series only has ~3 rows per 100 days
+                # so iloc[-20] would go back 20 months, not 4 weeks
+                def _get_nearest(df: pd.DataFrame, target_date) -> float:
+                    idx = (df["date"] - target_date).abs().idxmin()
+                    return df.loc[idx, "yield_pct"]
+
+                now    = base_hist["date"].max()
+                t_4w   = now - pd.Timedelta(weeks=4)
+                t_13w  = now - pd.Timedelta(weeks=13)
+
+                b_now  = base_hist["yield_pct"].iloc[-1]
+                q_now  = quote_hist["yield_pct"].iloc[-1]
+                b_4w   = _get_nearest(base_hist,  t_4w)
+                q_4w   = _get_nearest(quote_hist, t_4w)
+                b_13w  = _get_nearest(base_hist,  t_13w)
+                q_13w  = _get_nearest(quote_hist, t_13w)
+                diff_now = b_now  - q_now
+                diff_4w  = b_4w   - q_4w
+                diff_13w = b_13w  - q_13w
+
+                # Positive = spread widening (carry improving)
+                # Negative = spread compressing (carry deteriorating)
+                trend_4w  = diff_now - diff_4w
+                trend_13w = diff_now - diff_13w
+
+                t4_sig  = trend_4w  if abs(trend_4w)  > 0.02 else 0.0
+                t13_sig = trend_13w if abs(trend_13w) > 0.02 else 0.0
+
+                _level    = np.sign(dynamic_score)
+                _trends   = [t4_sig, t13_sig]
+                _opposing = sum(1 for t in _trends if t != 0 and np.sign(t) != _level)
+                _nonzero  = sum(1 for t in _trends if t != 0)
+
+                if abs(dynamic_score) > 0.25 and _nonzero > 0 and _opposing >= _nonzero * 0.5:
+                    dynamic_score *= 0.40
+                    logger.debug(
+                        f"  carry compress {base}/{quote}: "
+                        f"4w={trend_4w:+.3f} 13w={trend_13w:+.3f} → x0.40"
+                    )
+        except Exception as _e:
+            logger.debug(f"  carry trend check failed: {_e}")
+
+    # Blend: static rank (structural) + dynamic yield gap (current reality)
     carry_score = rank_score * 0.40 + dynamic_score * 0.60
     return float(np.clip(carry_score, -1.0, 1.0)), data_valid
-
 
 def _score_commodity(base: str, quote: str) -> Tuple[float, bool]:
     """
@@ -581,6 +673,41 @@ def _score_commodity(base: str, quote: str) -> Tuple[float, bool]:
 
     return float(pair_score), data_valid
 
+def _score_endo(base: str, quote: str) -> Tuple[float, bool]:
+    """
+    Driver 5: Endogenous policy direction differential.
+
+    Course principle: A CB hiking into strength is fundamentally different
+    from a CB cutting into weakness — even at the same yield level.
+    RBNZ cutting + BoJ hiking = bearish NZD/JPY regardless of absolute spread.
+
+    Returns (score -1 to +1, data_valid bool)
+    Positive = base currency more hawkish than quote.
+    """
+    try:
+        base_data  = _macro_scorer.get_score(base)
+        quote_data = _macro_scorer.get_score(quote)
+
+        base_endo  = base_data.get("endo_score", 0.0)
+        quote_endo = quote_data.get("endo_score", 0.0)
+        base_conv  = base_data.get("conviction", 0.0)
+        quote_conv = quote_data.get("conviction", 0.0)
+
+        # Pair score: base hawkish vs quote hawkish
+        pair_score = float(np.clip((base_endo - quote_endo) / 2.0, -1.0, 1.0))
+
+        # Data valid if at least one currency has real conviction
+        data_valid = (base_conv > 0.05 or quote_conv > 0.05)
+
+        logger.debug(
+            f"  endo {base}/{quote}: {base_endo:+.3f} vs {quote_endo:+.3f} "
+            f"→ pair={pair_score:+.3f} valid={data_valid}"
+        )
+        return pair_score, data_valid
+
+    except Exception as exc:
+        logger.warning(f"Analyst2 | endo score failed {base}/{quote}: {exc}")
+        return 0.0, False
 
 # ══════════════════════════════════════════════════════════════
 # MAIN CALCULATOR CLASS
@@ -715,6 +842,9 @@ class EndoExoScoreCalculator:
         # ── Driver 4: Commodity ───────────────────────────────
         commodity_score, comm_valid = _score_commodity(base, quote)
 
+        # ── Driver 5: Endogenous policy direction ─────────────  ← ADD THIS
+        endo_score, endo_valid = _score_endo(base, quote)
+
         # ── Weighted composite ────────────────────────────────
         # Adjust weights if data missing
         active_weights = {
@@ -722,6 +852,7 @@ class EndoExoScoreCalculator:
             "cot":       WEIGHTS["cot"]       if cot_valid      else 0.0,
             "carry":     WEIGHTS["carry"]     if carry_valid    else 0.0,
             "commodity": WEIGHTS["commodity"] if comm_valid     else 0.0,
+            "endo":      WEIGHTS["endo"]      if endo_valid     else 0.0,
         }
         total_weight = sum(active_weights.values())
 
@@ -735,15 +866,16 @@ class EndoExoScoreCalculator:
             yield_score     * norm_weights["yield"]     +
             cot_score       * norm_weights["cot"]       +
             carry_score     * norm_weights["carry"]     +
-            commodity_score * norm_weights["commodity"]
+            commodity_score * norm_weights["commodity"] +
+            endo_score      * norm_weights.get("endo", 0.0)
         )
         composite = float(np.clip(composite, -1.0, 1.0))
 
         # ── Confidence ────────────────────────────────────────
         # How many drivers agree on direction?
-        driver_scores = [yield_score, cot_score, carry_score, commodity_score]
+        driver_scores = [yield_score, cot_score, carry_score, commodity_score, endo_score]
         valid_scores  = [s for s, v in zip(driver_scores,
-                         [yield_valid, cot_valid, carry_valid, comm_valid]) if v]
+                         [yield_valid, cot_valid, carry_valid, comm_valid, endo_valid]) if v]
 
         if valid_scores:
             agreement = sum(1 for s in valid_scores if np.sign(s) == np.sign(composite))
@@ -773,6 +905,7 @@ class EndoExoScoreCalculator:
                 "cot_score":       round(cot_score, 4),
                 "carry_score":     round(carry_score, 4),
                 "commodity_score": round(commodity_score, 4),
+                "endo_score":      round(endo_score, 4),
             },
             "weights_used": {k: round(v, 3) for k, v in norm_weights.items()},
             "signal_valid": signal_valid,

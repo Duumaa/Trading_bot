@@ -99,6 +99,17 @@ PAIR_CURRENCIES: Dict[str, Tuple[str, str]] = {
 
 # ── Gate thresholds ───────────────────────────────────────────
 A2_MIN_CONFIDENCE     = 0.20   # Analyst 2 min confidence to trade
+# LightGBM per-pair accuracy dampener (from Kaggle training results 2026-03-16)
+# Tier 1 (88–90% accuracy) → 1.00 | Tier 2 (81–83%) → 0.94–0.95
+# Tier 3 (79–81%) → 0.90–0.92
+
+PAIR_MODEL_QUALITY: Dict[str, float] = {
+    "EURGBP": 1.00, "GBPUSD": 1.00, "USDCAD": 1.00,
+    "EURUSD": 1.00, "USDCHF": 1.00, "AUDUSD": 0.95,
+    "EURJPY": 0.95, "NZDUSD": 0.95, "NZDJPY": 0.94,
+    "USDJPY": 0.90, "GBPJPY": 0.92, "AUDJPY": 0.92,
+}
+
 A2_MIN_SCORE          = 0.20   # |score| must exceed this to be directional
 OPUS_BLOCK_CONVICTION = 0.50   # Opus conviction above this actively BLOCKS
 OPUS_MIN_CONVICTION   = 0.25   # Opus conviction below this = abstain (neutral)
@@ -107,7 +118,7 @@ SENT_BLOCK_THRESHOLD  = 0.30   # |sentiment| above this can block if opposing
 # ── Regime → sizing multiplier ────────────────────────────────
 REGIME_SIZE: Dict[str, float] = {
     "THV": 1.0,   # Trending High Vol  → full size
-    "TLV": 1.0,   # Trending Low Vol   → full size
+    "TLV": 0.5,   # Trending Low Vol   → Trending Low Vol   → half size (62.3% precision, reduced risk)
     "MR":  0.5,   # Mean Reverting     → half size
     "PNS": 0.0,   # Pre-News Stagnation→ flat
 }
@@ -123,7 +134,7 @@ REGIME_DIRECTION_RULE: Dict[str, str] = {
 
 # Technical analysts available flag
 # Set to True when TFT + PatchTSMixer models are trained and deployed
-TECHNICAL_ANALYSTS_AVAILABLE = False
+TECHNICAL_ANALYSTS_AVAILABLE = True
 
 CACHE_TTL_SIGNAL = 900   # 15 min
 
@@ -172,6 +183,103 @@ def _read_regime(r, pair: str) -> Dict:
         "source":     "fallback",
     }
 
+def _update_regime_history(r, pair: str, regime_data: Dict) -> None:
+    """
+    Push current regime probability snapshot to Redis history list.
+    Keeps last 6 readings (= 90 minutes of M15 candles).
+    Key: regime:stability:{pair}
+    """
+    try:
+        probs = regime_data.get("probabilities", {})
+        if not probs:
+            return
+
+        top_regime  = regime_data.get("regime", "TLV")
+        top_prob    = probs.get(top_regime, 0.0)
+        sorted_prob = sorted(probs.values(), reverse=True)
+        second_prob = sorted_prob[1] if len(sorted_prob) > 1 else 0.0
+        gap         = round(top_prob - second_prob, 4)
+
+        entry = {
+            "top_regime":  top_regime,
+            "top_prob":    round(top_prob, 4),
+            "second_prob": round(second_prob, 4),
+            "gap":         gap,
+            "ts":          datetime.now(timezone.utc).isoformat(),
+        }
+
+        key = f"regime:stability:{pair}"
+        # Read existing history
+        raw = r.get(key)
+        history = json.loads(raw) if raw else []
+        history.append(entry)
+        history = history[-6:]   # keep last 6 candles only
+
+        r.setex(key, 7200, json.dumps(history))  # TTL=2h
+
+    except Exception as exc:
+        logger.debug(f"Aggregator | Regime history update failed {pair}: {exc}")
+
+
+def _check_regime_stability(r, pair: str, regime_data: Dict) -> tuple:
+    """
+    Detect if the current regime is about to shift by tracking
+    the gap between top-2 regime probabilities over the last 6 candles.
+
+    Instability signals:
+      1. Current gap < 0.25  → two regimes nearly tied RIGHT NOW
+      2. Gap shrinking > 0.08/reading over last 4 readings → converging
+
+    Returns:
+        (is_unstable: bool, reason: str, current_gap: float)
+
+    Trading response: size_mult × 0.25 when unstable (skip marginal trades)
+    """
+    try:
+        probs = regime_data.get("probabilities", {})
+        if not probs:
+            return False, "", 1.0
+
+        top_regime  = regime_data.get("regime", "TLV")
+        top_prob    = probs.get(top_regime, 0.0)
+        sorted_prob = sorted(probs.values(), reverse=True)
+        second_prob = sorted_prob[1] if len(sorted_prob) > 1 else 0.0
+        current_gap = round(top_prob - second_prob, 4)
+
+        # Rule 1 — gap too small right now
+        if current_gap < 0.25:
+            reason = (
+                f"REGIME_UNSTABLE: gap={current_gap:.2f} "
+                f"({top_regime}={top_prob:.2f} vs 2nd={second_prob:.2f})"
+            )
+            return True, reason, current_gap
+
+        # Rule 2 — gap shrinking fast over last 4 readings
+        key = f"regime:stability:{pair}"
+        raw = r.get(key)
+        if raw:
+            history = json.loads(raw)
+            if len(history) >= 4:
+                gaps = [h["gap"] for h in history[-4:]]
+                # Check if each reading is lower than the previous
+                shrinking = all(
+                    gaps[i] > gaps[i + 1] for i in range(len(gaps) - 1)
+                )
+                total_shrink = gaps[0] - gaps[-1]
+                if shrinking and total_shrink > 0.20:
+                    reason = (
+                        f"REGIME_SHIFTING: gap shrinking "
+                        f"{gaps[0]:.2f}→{gaps[-1]:.2f} over 4 candles"
+                    )
+                    return True, reason, current_gap
+
+        return False, "", current_gap
+
+    except Exception as exc:
+        logger.debug(f"Aggregator | Regime stability check failed {pair}: {exc}")
+        return False, "", 1.0
+
+
 
 def _read_analyst2(r, pair: str) -> Dict:
     """Read Analyst 2 exogenous score from Redis."""
@@ -216,33 +324,54 @@ def _read_opus_pair(r, pair: str) -> Dict:
 
 def _read_technical(r, pair: str) -> Dict:
     """
-    Read Analysts 3+4 technical signals from Redis.
-    Returns neutral pass when models not yet trained.
+    Read Analyst 4 TCN + PatchTSMixer signal from Redis.
+    Key: features:analyst4:{pair}  TTL=900s
+    Returns neutral unavailable when flag is False or key missing.
     """
     if not TECHNICAL_ANALYSTS_AVAILABLE:
-        return {"available": False, "bias": "NEUTRAL", "confidence": 0.0}
+        return {"available": False, "direction": "FLAT", "confidence": 0.0}
 
-    # When models exist: keys are features:tft:{pair} and features:tcn:{pair}
-    tft = r.get(f"features:tft:{pair}")
-    tcn = r.get(f"features:tcn:{pair}")
-    if tft and tcn:
-        tft_d = json.loads(tft)
-        tcn_d = json.loads(tcn)
+    val = r.get(f"features:analyst4:{pair}")
+    if val:
+        d = json.loads(val)
         return {
-            "available":  True,
-            "tft_bias":   tft_d.get("bias", "NEUTRAL"),
-            "tft_conf":   tft_d.get("confidence", 0.0),
-            "tcn_bias":   tcn_d.get("bias", "NEUTRAL"),
-            "tcn_conf":   tcn_d.get("confidence", 0.0),
+            "available"  : True,
+            "direction"  : d.get("direction",  "FLAT"),
+            "confidence" : d.get("confidence", 0.0),
+            "tcn_prob"   : d.get("tcn_prob",   0.5),
+            "patch_prob" : d.get("patch_prob",  0.5),
+            "agreed"     : d.get("agreed",      False),
+            "gate"       : d.get("gate",        "FAIL"),
+            "regime"     : d.get("regime",      "MR"),
         }
-    return {"available": False, "bias": "NEUTRAL", "confidence": 0.0}
+    return {"available": False, "direction": "FLAT", "confidence": 0.0}
 
+def _read_entry(r, pair: str) -> Dict:
+    """Read Analyst 4 entry engine signal from Redis."""
+    val = r.get(f"features:entry:{pair}")
+    if val:
+        return json.loads(val)
+    # Cache miss — compute now
+    try:
+        from features.entry_engine import entry_engine
+        results = entry_engine.compute_all()
+        val = r.get(f"features:entry:{pair}")
+        if val:
+            return json.loads(val)
+    except Exception as exc:
+        logger.warning(f"Aggregator | Entry engine recompute failed: {exc}")
+    return {
+        "entry_score": 0.5, "entry_type": "WAIT",
+        "wait": True, "reason": "No entry data",
+        "direction": "FLAT", "available": False,
+    }
 
 # ══════════════════════════════════════════════════════════════
 # GATE LOGIC
 # ══════════════════════════════════════════════════════════════
 
 def _gate1_fundamental(
+    r,
     regime_data: Dict,
     a2_data: Dict,
     pair: str,
@@ -263,6 +392,10 @@ def _gate1_fundamental(
     a2_conf    = a2_data.get("confidence", 0.0)
     a2_valid   = a2_data.get("signal_valid", False)
 
+    # Always update history — even on FAIL paths
+    # Stability tracking needs data regardless of trade outcome
+    _update_regime_history(r, pair, regime_data)
+
     # PNS → always flat
     if regime == "PNS":
         return "FAIL:PNS_REGIME", "FLAT", regime, 0.0
@@ -271,6 +404,18 @@ def _gate1_fundamental(
     if not a2_valid:
         return "FAIL:A2_INVALID", "FLAT", regime, 0.0
 
+    size = REGIME_SIZE.get(regime, 1.0)
+
+    # ── MR regime special handling ────────────────────────────────────────
+    # In MR, A2 neutral is EXPECTED. Direction deferred to A4 entry engine.
+    if regime == "MR":
+        if a2_bias != "NEUTRAL" and abs(a2_score) >= A2_MIN_SCORE:
+            direction = "SHORT_BASE" if a2_bias == "LONG_BASE" else "LONG_BASE"
+            return "PASS:MR_FADE", direction, regime, size
+        else:
+            return "PASS:MR_DEFER", "FLAT", regime, size
+
+    # ── THV / TLV — A2 must be strong ────────────────────────────────────
     if a2_bias == "NEUTRAL" or abs(a2_score) < A2_MIN_SCORE:
         return "FAIL:A2_NEUTRAL", "FLAT", regime, 0.0
 
@@ -296,6 +441,20 @@ def _gate1_fundamental(
         direction = (
             "SHORT_BASE" if raw_direction == "LONG_BASE" else "LONG_BASE"
         )
+
+    # ── Regime stability check ────────────────────────────────────────────
+    # Update history first, then check stability
+    _update_regime_history(r, pair, regime_data)
+    is_unstable, unstable_reason, gap = _check_regime_stability(r, pair, regime_data)
+    if is_unstable:
+        # Don't block — reduce size to 0.25x (quarter size, not skip)
+        # Rationale: signal may still be valid, but regime boundary = higher risk
+        reduced_size = round(size * 0.25, 2)
+        logger.warning(
+            f"Aggregator | {pair} {unstable_reason} "
+            f"— size reduced {size}x → {reduced_size}x"
+        )
+        return f"PASS:UNSTABLE(gap={gap:.2f})", direction, regime, reduced_size
 
     return "PASS", direction, regime, size
 
@@ -365,29 +524,63 @@ def _gate2_sentiment(
 
 def _gate3_technical(technical_data: Dict, direction: str) -> str:
     """
-    Gate 3: Technical confirmation (Analysts 3+4).
-
-    When TECHNICAL_ANALYSTS_AVAILABLE=False: always SKIP (paper trading).
-    When available: both TFT and TCN must agree with direction.
+    Gate 3: Technical ML confirmation (Analyst 4 — TCN + PatchTSMixer).
+    When TECHNICAL_ANALYSTS_AVAILABLE=False: always SKIP.
+    When available: both models must agree with fundamental direction.
     """
     if not technical_data.get("available", False):
         return "SKIP"
 
-    tft_bias = technical_data.get("tft_bias", "NEUTRAL")
-    tcn_bias = technical_data.get("tcn_bias", "NEUTRAL")
-    tft_conf = technical_data.get("tft_conf", 0.0)
-    tcn_conf = technical_data.get("tcn_conf", 0.0)
+    a4_direction = technical_data.get("direction", "FLAT")
+    a4_gate      = technical_data.get("gate", "FAIL")
+    a4_conf      = technical_data.get("confidence", 0.0)
+    tcn_prob     = technical_data.get("tcn_prob", 0.5)
+    patch_prob   = technical_data.get("patch_prob", 0.5)
 
-    def _agrees(bias: str, direction: str) -> bool:
-        return bias == direction or bias == "NEUTRAL"
+    if a4_gate != "PASS":
+        return f"FAIL:A4_NOAGREE(tcn={tcn_prob:.2f},patch={patch_prob:.2f})"
 
-    if not _agrees(tft_bias, direction):
-        return f"FAIL:TFT_DISAGREES({tft_bias})"
-    if not _agrees(tcn_bias, direction):
-        return f"FAIL:TCN_DISAGREES({tcn_bias})"
+    if a4_direction == "FLAT":
+        return "FAIL:A4_FLAT"
 
-    return "PASS"
+    # Normalise direction strings — A4 uses LONG/SHORT, Gate1 uses LONG_BASE/SHORT_BASE
+    a4_norm = "LONG_BASE" if a4_direction == "LONG" else ("SHORT_BASE" if a4_direction == "SHORT" else "FLAT")
+    if a4_norm != direction:
+        return f"FAIL:A4_DISAGREES({a4_direction}_vs_{direction})"
 
+    return f"PASS:A4({a4_direction},conf={a4_conf:.2f})"
+def _gate3_entry(entry_data: Dict, direction: str) -> str:
+    """
+    Gate 3: Price action entry timing (Analyst 4 — EntryEngine).
+
+    Validates WHEN to enter based on VWAP, RSI, OBI, and momentum.
+    Direction already confirmed by Gates 1+2. This gate ensures we
+    don't enter at a bad price (extended, wide spread, OBI opposing).
+
+    Returns:
+      PASS          — entry_score >= 0.65, enter this bar
+      PASS_WAIT     — entry_score 0.40–0.65, enter but expect slippage
+      FAIL:reason   — entry_score < 0.40, skip this bar entirely
+    """
+    if not entry_data.get("available", False):
+        # Entry engine not yet computed — allow trade (conservative default)
+        return "PASS_WAIT"
+
+    score      = entry_data.get("entry_score", 0.0)
+    entry_type = entry_data.get("entry_type", "WAIT")
+    wait       = entry_data.get("wait", True)
+    reason     = entry_data.get("reason", "")
+
+    # Hard fail — setup is actively bad
+    if score < 0.40:
+        return f"FAIL:ENTRY_SCORE_LOW({score:.2f})|{entry_type}"
+
+    # Good entry — fire now
+    if score >= 0.65:
+        return f"PASS|{entry_type}|score={score:.2f}"
+
+    # Marginal — allow but flag as waiting
+    return f"PASS_WAIT|{entry_type}|score={score:.2f}"
 
 def _compute_confidence(
     a2_data: Dict,
@@ -395,6 +588,7 @@ def _compute_confidence(
     sentiment_data: Dict,
     regime_data: Dict,
     conflict_flag: str,
+    tech_data: Optional[Dict] = None,
 ) -> float:
     """
     Compute final trade confidence score.
@@ -404,6 +598,7 @@ def _compute_confidence(
       - Opus conviction (boosts confidence when aligned)
       - Sentiment confidence (minor boost)
       - Regime confidence (minor boost)
+      - A4 TCN+PatchTSMixer confidence (boost when strong)
       - Conflict penalty (reduces if weak conflict present)
     """
     a2_conf      = a2_data.get("confidence", 0.0)
@@ -432,6 +627,14 @@ def _compute_confidence(
 
     # Regime confidence boost (minor)
     conf += regime_conf * 0.10
+
+    # ── A4 TCN + PatchTSMixer confidence boost ─────────────────────────
+    if tech_data and tech_data.get("agreed", False):
+        a4_conf = tech_data.get("confidence", 0.0)
+        if a4_conf > 0.5:
+            conf *= 1.10
+        elif a4_conf > 0.3:
+            conf *= 1.05
 
     # Conflict penalty
     if conflict_flag == "A2_VS_OPUS_WEAK":
@@ -481,12 +684,63 @@ class SignalAggregator:
         a2_data        = _read_analyst2(self.r, pair)
         sentiment_data = _read_sentiment(self.r, pair)
         opus_data      = _read_opus_pair(self.r, pair)
+        
+        # ── Opus staleness + conflict guard ──────────────────────────────
+        _opus_generated = opus_data.get("generated_at", "")
+        # Fallback: pair keys don't have generated_at — check weekly key
+        if not _opus_generated:
+            try:
+                _weekly = self.r.get("features:opus:weekly")
+                if _weekly:
+                    import json as _j
+                    _opus_generated = _j.loads(_weekly).get("generated_at", "")
+            except Exception:
+                pass
+
+        _opus_age_days = 999
+        if _opus_generated:
+            try:
+                import datetime as _dt
+                _opus_dt       = _dt.datetime.fromisoformat(
+                    _opus_generated.replace("Z", "+00:00"))
+                _opus_age_days = (_dt.datetime.now(_dt.timezone.utc) - _opus_dt).days
+            except Exception:
+                pass
+        if _opus_age_days > 5:
+            logger.warning(f"Aggregator | {pair}: Opus {_opus_age_days}d old → NEUTRAL")
+            opus_data = {"bias": "NEUTRAL", "conviction": 0.0}
+        else:
+            # Conflict check: opus vs yield trend direction
+            try:
+                _yf = self.r.get(f"features:yield:{pair}")
+                if _yf:
+                    import json as _json
+                    _yf_data   = _json.loads(_yf)
+                    _trend_4w  = _yf_data.get("yield_trend_4w_10Y", 0.0)
+                    _trend_13w = _yf_data.get("yield_trend_13w_10Y", 0.0)
+                    _obias     = opus_data.get("bias", "NEUTRAL")
+                    _oconv     = opus_data.get("conviction", 0.0)
+                    _opus_long = _obias == "LONG_BASE"
+                    if (_opus_long and _trend_4w < -0.15 and _trend_13w < -0.15) or \
+                       (not _opus_long and _trend_4w > 0.15 and _trend_13w > 0.15):
+                        logger.warning(
+                            f"Aggregator | {pair}: Opus conflicts yield trend "
+                            f"(4w={_trend_4w:+.3f} 13w={_trend_13w:+.3f}) "
+                            f"→ conviction {_oconv:.2f}→{_oconv*0.5:.2f}"
+                        )
+                        opus_data = dict(opus_data)
+                        opus_data["conviction"] = _oconv * 0.5
+            except Exception as _e:
+                logger.warning(f"Aggregator | {pair}: Opus conflict check failed: {_e}")
+        # ── end guard ─────────────────────────────────────────────────────
         tech_data      = _read_technical(self.r, pair)
+        entry_data     = _read_entry(self.r, pair)
 
         now = datetime.now(timezone.utc).isoformat()
 
         # ── Gate 1: Fundamental ───────────────────────────────
         g1_result, direction, regime, size_mult = _gate1_fundamental(
+            self.r,
             regime_data, a2_data, pair
         )
 
@@ -513,8 +767,35 @@ class SignalAggregator:
             self._cache(pair, decision)
             return decision
 
-        # ── Gate 3: Technical ─────────────────────────────────
-        g3_result = _gate3_technical(tech_data, direction)
+        # ── Gate 3: Technical ML (TCN + PatchTSMixer) ────────
+        # MR_DEFER: A2 was neutral — A4 supplies direction
+        if g1_result == "PASS:MR_DEFER" and direction == "FLAT":
+            a4_dir = tech_data.get("direction", "FLAT")
+            if a4_dir == "LONG":
+                direction = "LONG_BASE"
+            elif a4_dir == "SHORT":
+                direction = "SHORT_BASE"
+            else:
+                decision = self._flat_decision(
+                    pair, g1_result, "PASS", "FAIL:MR_A4_FLAT",
+                    regime_data, a2_data, opus_data, sentiment_data,
+                    "MR_NO_DIRECTION", now
+                )
+                self._cache(pair, decision)
+                return decision
+
+        g3_ml = _gate3_technical(tech_data, direction)
+
+        if g3_ml.startswith("FAIL"):
+            decision = self._flat_decision(
+                pair, "PASS", "PASS", g3_ml,
+                regime_data, a2_data, opus_data, sentiment_data,
+                "A4_BLOCK", now
+            )
+            self._cache(pair, decision)
+            return decision
+        # ── Gate 4: Entry timing (rule-based) ─────────────────
+        g3_result = _gate3_entry(entry_data, direction)
 
         if g3_result.startswith("FAIL"):
             decision = self._flat_decision(
@@ -528,8 +809,10 @@ class SignalAggregator:
         # ── All gates passed — compute final decision ─────────
         confidence = _compute_confidence(
             a2_data, opus_data, sentiment_data,
-            regime_data, conflict_flag
+            regime_data, conflict_flag,
+            tech_data=tech_data,
         )
+        confidence = round(confidence * PAIR_MODEL_QUALITY.get(pair, 1.0), 4)
 
         # Convert direction to action
         action = "LONG" if direction == "LONG_BASE" else "SHORT"
@@ -542,7 +825,11 @@ class SignalAggregator:
             "size_mult":  size_mult,
             "gate1":      g1_result,
             "gate2":      g2_result,
-            "gate3":      g3_result,
+            "gate3":      g3_ml,
+            "gate4":      g3_result,
+	    "entry_score": round(entry_data.get("entry_score", 0.0), 4),
+            "entry_type":  entry_data.get("entry_type", "WAIT"),
+            "entry_reason": entry_data.get("reason", ""),
             "regime":     regime,
             "a2_score":   round(a2_data.get("score", 0.0), 4),
             "a2_bias":    a2_data.get("bias", "NEUTRAL"),
@@ -551,6 +838,9 @@ class SignalAggregator:
             "opus_conv":  round(opus_data.get("conviction", 0.0), 4),
             "sent_bias":  sentiment_data.get("bias", "NEUTRAL"),
             "sent_score": round(sentiment_data.get("sentiment", 0.0), 4),
+            "tcn_prob":   round((tech_data or {}).get("tcn_prob",   0.5), 4),
+            "patch_prob": round((tech_data or {}).get("patch_prob", 0.5), 4),
+            "a4_conf":    round((tech_data or {}).get("confidence", 0.0), 4),
             "conflict":   conflict_flag,
             "reason":     f"All gates passed | {direction} | regime={regime}",
             "updated_at": now,
@@ -569,6 +859,7 @@ class SignalAggregator:
             except Exception as exc:
                 logger.error(f"Aggregator | {pair} failed: {exc}")
                 results[pair] = self._emergency_flat(pair)
+        self._persist_to_db(results)
         return results
 
     def get_tradeable(self) -> List[Dict]:
@@ -685,6 +976,75 @@ class SignalAggregator:
             )
         except Exception as exc:
             logger.warning(f"Aggregator | Cache write failed {pair}: {exc}")
+
+
+    def _persist_to_db(self, results: Dict[str, Dict]) -> None:
+        """Persist all pair signals to analyst_signals and regime_history tables."""
+        try:
+            import json as _json
+            from data_pipeline.storage.timeseries_db import db
+            from sqlalchemy import text
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc)
+            signal_rows = []
+            regime_rows = []
+
+            for pair, d in results.items():
+                action   = d.get("action", "FLAT")
+                conf     = float(d.get("confidence", 0.0))
+                _regime_map = {"THV": "TRENDING_HV", "TLV": "TRENDING_LV", "MR": "MEAN_REVERTING", "PNS": "PRE_NEWS_STAGNATION"}
+                regime   = _regime_map.get(d.get("regime", "PNS"), "PRE_NEWS_STAGNATION")
+                size     = float(d.get("size_multiplier", 1.0))
+                sig_val  = 1.0 if action == "LONG" else -1.0 if action == "SHORT" else 0.0
+                meta     = _json.dumps({
+                    "regime": regime,
+                    "size":   size,
+                    "reason": d.get("reason", ""),
+                    "a2_bias": d.get("a2_bias", ""),
+                })
+                signal_rows.append({
+                    "time": now, "analyst_id": 1,
+                    "analyst_name": "aggregator",
+                    "pair": pair, "currency": pair[:3],
+                    "signal_type": action,
+                    "signal_value": sig_val,
+                    "confidence": conf,
+                    "metadata": meta,
+                    "model_version": "v1.0",
+                })
+                regime_rows.append({
+                    "time": now, "pair": pair,
+                    "regime": regime, "confidence": conf,
+                    "prob_thv": 0.0, "prob_tlv": 0.0,
+                    "prob_mr": 0.0, "prob_pns": 0.0,
+                    "model_version": "v1.0",
+                })
+
+            with db.connection() as conn:
+                for row in signal_rows:
+                    conn.execute(text("""
+                        INSERT INTO analyst_signals
+                            (time, analyst_id, analyst_name, pair, currency,
+                             signal_type, signal_value, confidence, metadata, model_version)
+                        VALUES
+                            (:time, :analyst_id, :analyst_name, :pair, :currency,
+                             :signal_type, :signal_value, :confidence, CAST(:metadata AS jsonb), :model_version)
+                    """), row)
+                for row in regime_rows:
+                    conn.execute(text("""
+                        INSERT INTO regime_history
+                            (time, pair, regime, confidence,
+                             prob_thv, prob_tlv, prob_mr, prob_pns, model_version)
+                        VALUES
+                            (:time, :pair, :regime, :confidence,
+                             :prob_thv, :prob_tlv, :prob_mr, :prob_pns, :model_version)
+                        ON CONFLICT DO NOTHING
+                    """), row)
+                conn.commit()
+            logger.success(f"Aggregator | Persisted {len(signal_rows)} signals to DB")
+        except Exception as exc:
+            logger.warning(f"Aggregator | DB persist failed: {exc}")
 
     @staticmethod
     def _flat_decision(

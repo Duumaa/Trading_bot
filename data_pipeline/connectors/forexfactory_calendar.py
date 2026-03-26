@@ -315,6 +315,7 @@ class ForexFactoryCalendar:
 
     def __init__(self) -> None:
         self._scraper = _make_scraper()
+        self._weekly_cache = None
 
     def _get(self, url: str, retries: int = 3) -> Optional[str]:
         """HTTP GET with retry + random delay (your original rate limit approach)."""

@@ -30,6 +30,14 @@ JPY scaling note:
   some as cTrader points (15787.3). We detect and normalise at load time.
   Rule: if JPY bid > 1000, divide by 100.
 
+OBI note (2026-03-16):
+  Pepperstone sends symmetric size buckets at every depth level, so the
+  pre-computed bid_ask_imbalance column is always 0. We now compute
+  weighted OBI directly from the JSONB bids/asks columns, weighting
+  each level by proximity to mid: L1=5, L2=4, L3=3, L4=2, L5=1.
+  This produces real non-zero signals whenever one side is more aggressive
+  at the levels closest to the current price.
+
 Features produced per pair (12 total):
   imbalance_1m         Bid-ask volume imbalance last 1 min [-1, +1]
   imbalance_5m         Bid-ask volume imbalance last 5 min [-1, +1]
@@ -65,7 +73,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import redis
+
 from dotenv import load_dotenv
 from loguru import logger
 from sqlalchemy import text
@@ -142,16 +150,10 @@ class OrderFlowFeatureEngine:
 
     @property
     def redis(self) -> redis.Redis:
-        """Lazy Redis connection with password auth."""
         if self._redis is None:
-            self._redis = redis.Redis(
-                host=os.getenv("REDIS_HOST", "localhost"),
-                port=int(os.getenv("REDIS_PORT", "6379")),
-                password=os.getenv("REDIS_PASSWORD") or None,
-                decode_responses=True,
-            )
+            from data_pipeline.storage.redis_pool import redis_client
+            self._redis = redis_client
         return self._redis
-
     def _redis_get(self, key: str) -> Optional[Dict[str, float]]:
         try:
             raw = self.redis.get(key)
@@ -265,8 +267,8 @@ class OrderFlowFeatureEngine:
             if pair in JPY_PAIRS:
                 mask = df["bid"] > 1000
                 if mask.any():
-                    df.loc[mask, "bid"]  = df.loc[mask, "bid"]  / 100.0
-                    df.loc[mask, "ask"]  = df.loc[mask, "ask"]  / 100.0
+                    df.loc[mask, "bid"]    = df.loc[mask, "bid"]    / 100.0
+                    df.loc[mask, "ask"]    = df.loc[mask, "ask"]    / 100.0
                     df.loc[mask, "spread"] = df.loc[mask, "spread"] / 100.0
                     logger.debug(f"FlowEngine | {pair}: corrected {mask.sum()} scaled tick rows")
 
@@ -280,9 +282,10 @@ class OrderFlowFeatureEngine:
         """
         Load the most recent N order book snapshots for a pair.
 
-        The order_book_snapshots table stores pre-computed imbalance values
-        and total bid/ask volumes. The JSONB bids/asks columns are also
-        available but we use the pre-computed columns for efficiency.
+        Loads the raw JSONB bids/asks columns so we can compute weighted
+        OBI ourselves. Pepperstone sends symmetric size buckets at every
+        depth level so the pre-computed bid_ask_imbalance column is always
+        0 and cannot be used.
 
         Args:
             pair:  Currency pair symbol
@@ -290,14 +293,16 @@ class OrderFlowFeatureEngine:
 
         Returns:
             DataFrame with [time, bid_ask_imbalance, total_bid_volume,
-            total_ask_volume] or None if table is empty.
+            total_ask_volume, bids, asks] or None if table is empty.
         """
         query = text("""
             SELECT
                 time,
                 bid_ask_imbalance,
                 total_bid_volume,
-                total_ask_volume
+                total_ask_volume,
+                bids,
+                asks
             FROM order_book_snapshots
             WHERE symbol = :symbol
             ORDER BY time DESC
@@ -314,7 +319,10 @@ class OrderFlowFeatureEngine:
 
             df = pd.DataFrame(
                 rows,
-                columns=["time", "bid_ask_imbalance", "total_bid_volume", "total_ask_volume"],
+                columns=[
+                    "time", "bid_ask_imbalance", "total_bid_volume",
+                    "total_ask_volume", "bids", "asks",
+                ],
             )
             df["time"] = pd.to_datetime(df["time"], utc=True)
             df = df.sort_values("time").reset_index(drop=True)
@@ -391,13 +399,36 @@ class OrderFlowFeatureEngine:
         # ── Order book features ───────────────────────────────────────────────
         if ob_df is not None and len(ob_df) >= 2:
 
-            # Use pre-computed imbalance from the snapshots table
-            # imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol) in [-1, +1]
-            recent_imbalance = ob_df["bid_ask_imbalance"].dropna()
+            # Weighted OBI from raw JSONB bids/asks.
+            # Pepperstone sends identical size buckets on both sides so the
+            # pre-computed bid_ask_imbalance column is always 0.
+            # We weight each depth level by proximity to mid:
+            #   L1 (closest) = weight N, L2 = N-1, ..., LN = 1
+            # This gives a real signal when one side has more size at the
+            # levels nearest to the current price.
+            def _weighted_obi(row: pd.Series) -> float:
+                try:
+                    bids = row["bids"]
+                    asks = row["asks"]
+                    if isinstance(bids, str):
+                        bids = json.loads(bids)
+                    if isinstance(asks, str):
+                        asks = json.loads(asks)
+                    if not bids or not asks:
+                        return 0.0
+                    n       = min(len(bids), len(asks))
+                    weights = list(range(n, 0, -1))  # [5,4,3,2,1] for 5 levels
+                    wb = sum(bids[i]["size"] * weights[i] for i in range(n))
+                    wa = sum(asks[i]["size"] * weights[i] for i in range(n))
+                    denom = wb + wa
+                    return (wb - wa) / denom if denom > 0 else 0.0
+                except Exception:
+                    return 0.0
 
-            if len(recent_imbalance) >= 1:
-                feats["imbalance_5m"] = round(float(recent_imbalance.mean()), 4)
-                feats["imbalance_1m"] = round(float(recent_imbalance.iloc[-1]), 4)
+            if "bids" in ob_df.columns and "asks" in ob_df.columns:
+                obi_series = ob_df.apply(_weighted_obi, axis=1)
+                feats["imbalance_5m"] = round(float(obi_series.mean()), 4)
+                feats["imbalance_1m"] = round(float(obi_series.iloc[-1]), 4)
                 feats["flow_imbalance_delta"] = round(
                     feats["imbalance_1m"] - feats["imbalance_5m"], 4
                 )
@@ -447,8 +478,8 @@ class OrderFlowFeatureEngine:
         ask_diff = df["ask"].diff()
         bid_diff = df["bid"].diff()
 
-        aggressive_buys  = int((ask_diff > 0).sum())
-        aggressive_sells = int((bid_diff < 0).sum())
+        aggressive_buys   = int((ask_diff > 0).sum())
+        aggressive_sells  = int((bid_diff < 0).sum())
         total_directional = aggressive_buys + aggressive_sells
 
         if total_directional == 0:
@@ -459,7 +490,7 @@ class OrderFlowFeatureEngine:
     @staticmethod
     def _tick_velocity(
         ticks_df: pd.DataFrame,
-        now_utc: datetime,
+        now_utc:  datetime,
     ) -> Tuple[float, float]:
         """
         Compute tick arrival rate for 1-minute and 5-minute windows.
@@ -478,13 +509,13 @@ class OrderFlowFeatureEngine:
         # Convert to numpy for fast comparison
         cutoff_1m_np = np.datetime64(cutoff_1m.replace(tzinfo=None), 'ns')
         cutoff_5m_np = np.datetime64(cutoff_5m.replace(tzinfo=None), 'ns')
-        times_np = times.values
+        times_np     = times.values
 
         count_1m = int(np.sum(times_np >= cutoff_1m_np))
         count_5m = int(np.sum(times_np >= cutoff_5m_np))
 
-        velocity_1m = round(float(count_1m), 2)          # ticks in last 1 min
-        velocity_5m = round(float(count_5m / 5.0), 2)    # avg ticks/min over 5 min
+        velocity_1m = round(float(count_1m), 2)           # ticks in last 1 min
+        velocity_5m = round(float(count_5m / 5.0), 2)     # avg ticks/min over 5 min
 
         return velocity_1m, velocity_5m
 

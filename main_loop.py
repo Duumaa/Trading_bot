@@ -77,6 +77,7 @@ M15_SECONDS          = 900     # 15 minutes
 CANDLE_WARMUP_DAYS   = 3       # fetch last N days on startup
 FEATURE_REFRESH_MIN  = 14      # refresh stat/vwap if > N min old
 DATA_PIPELINE_HOURS  = 4       # news/COT/yields refresh interval
+CALENDAR_HOURS       = 1       # ForexFactory calendar refresh interval
 SENTIMENT_HOURS      = 4       # Groq sentiment refresh interval
 POSITION_SYNC_BARS   = 4       # sync positions every N bars (1h)
 DAILY_SNAPSHOT_HOUR  = 23      # UTC hour for daily snapshot
@@ -95,17 +96,43 @@ NY_CLOSE      = 21   # 21:00 UTC (weekdays)
 
 def _is_market_open() -> bool:
     """
-    Check if forex market is currently open.
-    Forex is closed Saturday 21:00 UTC to Sunday 21:00 UTC.
+    Check if forex market is currently open for trading.
+
+    Closed windows:
+      - Saturday all day
+      - Sunday before 21:00 UTC (market closed)
+      - Sunday 21:00 → Monday 23:30 UTC (thin liquidity blackout)
+        → Asian open gap window: wide spreads, FIX drops, SL hunts
+        → In Mongolia time: market opens 06:00 Mon but bot waits until 07:30
+      - Any day 21:00 → 22:00 UTC (daily rollover / session transition)
+        → Spreads widen briefly during broker rollover
     """
     now     = datetime.now(timezone.utc)
     weekday = now.weekday()   # 0=Mon, 5=Sat, 6=Sun
     hour    = now.hour
+    minute  = now.minute
 
-    if weekday == 5:   # Saturday — always closed
+    # Saturday — always closed
+    if weekday == 5:
         return False
-    if weekday == 6 and hour < 21:   # Sunday before 21:00
+
+    # Sunday before 22:00 UTC — market closed + early Asian gap window
+    if weekday == 6:
         return False
+
+    # Monday before 23:30 UTC — thin liquidity blackout
+    # FIX collector drops connections, spreads wide, VWAP stale
+    # Mongolia time: 06:00-07:30 Mon = 22:00 Sun - 23:30 Mon UTC
+    if weekday == 0 and hour == 7 and minute < 30:
+        return False
+    if weekday == 0 and hour < 7:
+        return False
+
+    # Daily rollover blackout — 21:00-22:00 UTC every day
+    # Broker widens spreads during session transition
+    if hour == 21:
+        return False
+
     return True
 
 
@@ -190,9 +217,9 @@ def _startup_features() -> bool:
 def _startup_analysts() -> bool:
     """
     Run Analysts 1 + 2 on startup.
-    Ensures regime + exogenous scores are cached before first bar.
     """
     logger.info("MainLoop | Running startup analysis...")
+    from data_pipeline.connectors.ctrader_rest_api import connector
 
     # Analyst 2 — exogenous scores
     try:
@@ -241,6 +268,20 @@ def _startup_analysts() -> bool:
             logger.success("MainLoop | Groq sentiment loaded from cache")
     except Exception as exc:
         logger.warning(f"MainLoop | Groq startup failed: {exc}")
+    # Start Telegram command bot
+    # Start Telegram command bot
+    alerts.start_command_bot()
+
+    # Subscribe to real-time spot prices via REST API connection
+    try:
+        pairs = [
+            "EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","NZDUSD",
+            "USDCAD","EURGBP","EURJPY","GBPJPY","AUDJPY","NZDJPY"
+        ]
+        connector.subscribe_spots(pairs)
+        logger.success("MainLoop | Spot price subscriptions active ✅")
+    except Exception as exc:
+        logger.warning(f"MainLoop | Spot subscription failed: {exc}")
 
     return True
 
@@ -298,11 +339,27 @@ def _process_bar(
         f"MainLoop | ── BAR {bar_number} "
         f"{now.strftime('%Y-%m-%d %H:%M UTC')} ──"
     )
-
     results = []
 
+    # Respect Telegram /pause command
+    if alerts.is_paused:
+        logger.info("MainLoop | Trading paused via Telegram -- skipping bar")
+        return result
     # 1. Fetch latest candles
     _fetch_latest_candles(connector)
+
+    # Sync live balance every M15 cycle so kill switch uses real numbers
+    try:
+        account_info = connector.get_account_balance()
+        if account_info:
+            balance = account_info.get("balance", 0.0)
+            equity  = account_info.get("equity",  balance)
+            if balance > 0:
+                from execution.risk_manager import risk_manager
+                risk_manager.account.update(balance, equity)
+                logger.debug(f"MainLoop | Balance synced: ${balance:,.2f}")
+    except Exception as exc:
+        logger.warning(f"MainLoop | Balance sync skipped: {exc}")
 
     # 2. Refresh fast features
     _refresh_fast_features()
@@ -318,10 +375,11 @@ def _process_bar(
     try:
         from execution.signal_aggregator import signal_aggregator
         decisions = signal_aggregator.evaluate_all()
-        tradeable = [
-            d for d in decisions.values()
-            if d.get("action") in ("LONG", "SHORT")
-        ]
+        tradeable = sorted(
+            [d for d in decisions.values() if d.get("action") in ("LONG", "SHORT")],
+            key=lambda x: x.get("confidence", 0),
+            reverse=True
+        )
         logger.info(
             f"MainLoop | Signals: "
             f"{sum(1 for d in decisions.values() if d['action']=='FLAT')} FLAT | "
@@ -332,10 +390,24 @@ def _process_bar(
         logger.error(f"MainLoop | Signal evaluation failed: {exc}")
         return results
 
+    # 4b. Technical invalidation check on open positions
+    try:
+        from execution.technical_exit_monitor import tech_exit_monitor
+        exit_actions = tech_exit_monitor.run_checks()
+        closed = [p for p, a in exit_actions.items() if a in ("CLOSED_FLIP", "CLOSED_DECAY")]
+        if closed:
+            logger.warning(f"MainLoop | TechExit closed positions: {closed}")
+    except Exception as exc:
+        logger.error(f"MainLoop | Technical exit monitor failed: {exc}")
+
     # 5. Execute signals
     if not dry_run and tradeable:
         from execution.order_executor import order_executor
         from execution.risk_manager   import risk_manager
+
+        # Reconcile Redis positions against cTrader reality
+        # Clears stale keys for positions closed via SL/TP without bot noticing
+        order_executor.reconcile_positions()
 
         if risk_manager.is_halted():
             logger.warning("MainLoop | Trading halted — skipping execution")
@@ -388,12 +460,75 @@ def _start_background_threads(dry_run: bool) -> None:
 
     # ── Live data stream ──────────────────────────────────────
     def _stream_thread():
-        try:
-            from data_pipeline.connectors.ctrader_live_stream import live_stream
-            live_stream.connect()
-            logger.info("MainLoop | Live stream started")
-        except Exception as exc:
-            logger.warning(f"MainLoop | Live stream failed: {exc}")
+        from data_pipeline.connectors.ctrader_live_stream import live_stream
+        while True:
+            try:
+                live_stream.connect()
+                logger.info("MainLoop | Live stream started")
+            except Exception as exc:
+                logger.warning(
+                    f"MainLoop | Live stream failed: {exc} "
+                    f"— retry in 30s"
+                )
+            time.sleep(30)
+
+    def _tick_watchdog_thread():
+        """
+        Watchdog: checks every 5 min if ticks are arriving.
+        If no tick in DB for 10+ minutes → force live stream reconnect.
+        Sends Telegram alert on reconnect.
+        """
+        import time as _time
+        from data_pipeline.storage.timeseries_db import db
+        from sqlalchemy import text as sa_text
+
+        logger.info("MainLoop | Tick watchdog started")
+        _time.sleep(120)  # wait 2 min after startup before first check
+
+        while True:
+            try:
+                with db.connection() as conn:
+                    row = conn.execute(sa_text("""
+                        SELECT NOW() - MAX(time) as age
+                        FROM ticks
+                        WHERE time > NOW() - INTERVAL '30 minutes'
+                    """)).fetchone()
+
+                age_seconds = None
+                if row and row[0]:
+                    age_seconds = row[0].total_seconds()
+
+                if age_seconds is None or age_seconds > 600:
+                    # No ticks for 10+ minutes — reconnect
+                    age_str = f"{int(age_seconds)}s" if age_seconds else "unknown"
+                    logger.warning(
+                        f"MainLoop | Tick watchdog: no ticks for {age_str} "
+                        f"— forcing live stream reconnect"
+                    )
+                    try:
+                        from data_pipeline.connectors.ctrader_live_stream import live_stream
+                        live_stream.disconnect()
+                        _time.sleep(3)
+                        live_stream.connect()
+                        logger.success("MainLoop | Tick watchdog: FIX collector restarted")
+                        try:
+                            alerts.send_message(
+                                f"⚠️ Tick watchdog: no ticks for {age_str}\n"
+                                f"Live stream reconnected automatically."
+                            )
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        logger.error(f"MainLoop | Tick watchdog reconnect failed: {exc}")
+                else:
+                    logger.debug(
+                        f"MainLoop | Tick watchdog: last tick {int(age_seconds)}s ago ✅"
+                    )
+
+            except Exception as exc:
+                logger.warning(f"MainLoop | Tick watchdog error: {exc}")
+
+            _time.sleep(300)  # check every 5 minutes
 
     # ── Data pipeline (news/COT/yields every 4h) ──────────────
     def _data_pipeline_thread():
@@ -420,8 +555,51 @@ def _start_background_threads(dry_run: bool) -> None:
                 yield_scraper.fetch_latest()
             except Exception as exc:
                 logger.debug(f"MainLoop | Yield scrape: {exc}")
-
-            time.sleep(DATA_PIPELINE_HOURS * 3600)
+            try:
+                # Commodity prices (Oil + Gold) — FRED + yfinance
+                import os, requests, yfinance as yf, pandas as pd
+                from sqlalchemy import text
+                from data_pipeline.storage.timeseries_db import db
+                # WTI Oil via FRED
+                fred_key = os.getenv("FRED_API_KEY")
+                resp = requests.get(
+                    "https://api.stlouisfed.org/fred/series/observations",
+                    params={"series_id": "DCOILWTICO", "api_key": fred_key,
+                            "observation_start": "2024-01-01",
+                            "file_type": "json", "sort_order": "asc"},
+                    timeout=30
+                )
+                oil_rows = [(o["date"], float(o["value"]))
+                            for o in resp.json().get("observations", [])
+                            if o["value"] not in (".", "")]
+                # Gold via yfinance
+                gold_df = yf.download("GC=F", start="2024-01-01",
+                                      progress=False, auto_adjust=True)
+                gold_rows = [(d.strftime("%Y-%m-%d"), float(r["Close"].iloc[0])
+                              if hasattr(r["Close"], "iloc") else float(r["Close"]))
+                             for d, r in gold_df.iterrows()
+                             if not pd.isna(r["Close"].iloc[0]
+                             if hasattr(r["Close"], "iloc") else r["Close"])]
+                with db.connection() as conn:
+                    for date, price in oil_rows:
+                        conn.execute(text("""
+                            INSERT INTO macro_indicators
+                                (time, country, indicator, actual, source)
+                            VALUES (:t, 'OIL', 'WTI_CLOSE', :p, 'fred')
+                            ON CONFLICT DO NOTHING
+                        """), {"t": f"{date}T00:00:00+00:00", "p": price})
+                    for date, price in gold_rows:
+                        conn.execute(text("""
+                            INSERT INTO macro_indicators
+                                (time, country, indicator, actual, source)
+                            VALUES (:t, 'XAU', 'GOLD_CLOSE', :p, 'yfinance')
+                            ON CONFLICT DO NOTHING
+                        """), {"t": f"{date}T00:00:00+00:00", "p": price})
+                    conn.commit()
+                logger.info(f"MainLoop | Commodities refreshed: {len(oil_rows)} oil, {len(gold_rows)} gold rows")
+            except Exception as exc:
+                logger.debug(f"MainLoop | Commodity refresh: {exc}")
+            time.sleep(CALENDAR_HOURS * 3600)
 
     # ── Groq sentiment (every 4h) ─────────────────────────────
     def _sentiment_thread():
@@ -472,8 +650,33 @@ def _start_background_threads(dry_run: bool) -> None:
                 risk_manager.take_daily_snapshot()
                 risk_manager.account.reset_daily()
                 logger.success("MainLoop | Daily snapshot taken + P&L reset")
+
+                # Monthly portfolio stop baseline reset (1st of each month)
+                if datetime.now(timezone.utc).day == 1:
+                    import redis, os
+                    r = redis.Redis(
+                        host=os.getenv("REDIS_HOST", "localhost"),
+                        port=int(os.getenv("REDIS_PORT", "6379")),
+                        password=os.getenv("REDIS_PASSWORD") or None,
+                        decode_responses=True
+                    )
+                    balance = risk_manager.account.get().get("balance", 0.0)
+                    r.set("risk:initial_balance", str(balance))
+                    logger.info(f"MainLoop | Monthly portfolio stop reset: ${balance:,.2f}")
+
             except Exception as exc:
                 logger.error(f"MainLoop | Daily snapshot failed: {exc}")
+            # Wait until 00:05 UTC next day then do a second reset
+            # to ensure kill switch is cleared before Asian session opens
+            try:
+                now2 = datetime.now(timezone.utc)
+                next_day = (now2 + timedelta(days=1)).replace(
+                    hour=0, minute=5, second=0, microsecond=0)
+                time.sleep(max(0, (next_day - now2).total_seconds()))
+                risk_manager.account.reset_daily()
+                logger.success("MainLoop | 00:05 UTC reset complete — kill switch cleared")
+            except Exception as exc:
+                logger.error(f"MainLoop | 00:05 reset failed: {exc}")
 
     # ── COT downloader (weekly Friday) ────────────────────────
     def _cot_thread():
@@ -490,7 +693,9 @@ def _start_background_threads(dry_run: bool) -> None:
             time.sleep(wait)
             try:
                 from data_pipeline.connectors.cot_downloader import cot_downloader
-                cot_downloader.download_and_store()
+                df = cot_downloader.fetch_latest()
+                if len(df) > 0:
+                    cot_downloader._store(df)
                 logger.success("MainLoop | COT data updated")
             except Exception as exc:
                 logger.warning(f"MainLoop | COT update failed: {exc}")
@@ -505,15 +710,133 @@ def _start_background_threads(dry_run: bool) -> None:
         ("cot-weekly",     _cot_thread),
     ]
 
+    # ── Feature schedulers (every 5–15 min) ──────────────────
+    def _feature_scheduler_thread():
+        logger.info("MainLoop | Feature scheduler thread started")
+        try:
+            from features.statistical_features import stat_engine
+            stat_engine.start_scheduler()
+            logger.info("MainLoop | stat_engine scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | stat scheduler: {exc}")
+        try:
+            from features.vwap_features import vwap_engine
+            vwap_engine.start_scheduler()
+            logger.info("MainLoop | vwap_engine scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | vwap scheduler: {exc}")
+        try:
+            from features.orderflow_features import flow_engine
+            flow_engine.start_scheduler()
+            logger.info("MainLoop | flow_engine scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | flow scheduler: {exc}")
+        try:
+            from features.entry_engine import entry_engine
+            entry_engine.start_scheduler()
+            logger.info("MainLoop | entry_engine scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | entry scheduler: {exc}")
+        try:
+            from execution.trailing_stop import trailing_stop_manager
+            trailing_stop_manager.start()
+            logger.info("MainLoop | trailing_stop_manager started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | trailing stop: {exc}")
+        try:
+            from features.liquidity_features import liq_engine
+            liq_engine.start_scheduler()
+            logger.info("MainLoop | liq_engine scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | liq scheduler: {exc}")
+        try:
+            from features.analyst4_inference import analyst4
+            analyst4.start_scheduler()
+            logger.info("MainLoop | analyst4 scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | analyst4 scheduler: {exc}")
+        # Thread stays alive so daemon doesn't get GC'd
+        while True:
+            time.sleep(3600)
+
+    def _tick_watchdog_thread():
+        """
+        Watchdog: checks every 5 min if FIX ticks are arriving.
+        If no tick in DB for 10+ min → restart fix_collector.
+        Sends Telegram alert when triggered.
+        """
+        from data_pipeline.storage.timeseries_db import db
+        from sqlalchemy import text as sa_text
+
+        logger.info("MainLoop | Tick watchdog started")
+        time.sleep(120)  # wait 2 min after startup before first check
+
+        while True:
+            try:
+                with db.connection() as conn:
+                    row = conn.execute(sa_text("""
+                        SELECT EXTRACT(EPOCH FROM (NOW() - MAX(time)))
+                        FROM ticks
+                        WHERE time > NOW() - INTERVAL '30 minutes'
+                    """)).fetchone()
+
+                age_seconds = float(row[0]) if row and row[0] else None
+
+                if age_seconds is None or age_seconds > 600:
+                    # No ticks for 10+ min — restart FIX collector
+                    age_str = f"{int(age_seconds)}s" if age_seconds else "unknown"
+                    logger.warning(
+                        f"MainLoop | Tick watchdog: no ticks for {age_str} "
+                        f"— restarting FIX collector"
+                    )
+                    try:
+                        from data_pipeline.connectors.ctrader_fix import fix_collector
+                        fix_collector.stop()
+                        time.sleep(5)
+                        fix_collector.start()
+                        logger.success(
+                            "MainLoop | Tick watchdog: FIX collector restarted"
+                        )
+                        try:
+                            alerts.send_message(
+                                f"⚠️ <b>Tick Watchdog</b>\n"
+                                f"No ticks for {age_str}\n"
+                                f"FIX collector restarted automatically."
+                            )
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        logger.error(
+                            f"MainLoop | Tick watchdog restart failed: {exc}"
+                        )
+                else:
+                    logger.debug(
+                        f"MainLoop | Tick watchdog: last tick "
+                        f"{int(age_seconds)}s ago ✅"
+                    )
+
+            except Exception as exc:
+                logger.warning(f"MainLoop | Tick watchdog error: {exc}")
+
+            time.sleep(300)  # check every 5 minutes
+
+    threads = [
+        ("data-pipeline",      _data_pipeline_thread),
+        ("sentiment",          _sentiment_thread),
+        ("analyst2",           _analyst2_thread),
+        ("opus",               _opus_thread),
+        ("daily-snapshot",     _daily_thread),
+        ("cot-weekly",         _cot_thread),
+        ("feature-schedulers", _feature_scheduler_thread),
+        #("tick-watchdog",      _tick_watchdog_thread),   # ← NEW
+    ]
+    # Stream thread only when market open
     # Stream thread only when market open
     if _is_market_open():
-        # FIX collector is the sole tick source — handles ticks + L2 order book
-        # Live stream disabled: conflicts with REST API (ALREADY_LOGGED_IN)
-        try:
-            from data_pipeline.connectors.ctrader_fix import fix_collector
-            threads.insert(0, ("fix-collector", fix_collector.start))
-        except Exception as exc:
-            logger.warning(f"MainLoop | FIX collector unavailable: {exc}")
+        # OpenAPI WebSocket live stream — replaces FIX collector
+        # Uses same auth token as REST API — no separate credentials needed
+        # Provides: real-time bid/ask prices + L2 order book depth (20 levels)
+        pass  # spot subscriptions handled in _startup_analysts() after REST API auth
 
     for name, target in threads:
         t = threading.Thread(target=target, daemon=True, name=name)
@@ -614,6 +937,61 @@ def main(dry_run: bool = False, status_only: bool = False) -> None:
 
     # ── Startup sequence ──────────────────────────────────────
     logger.info("MainLoop | Running startup sequence...")
+
+    # ── Startup reconciliation — ALWAYS first ────────────────────────────
+    # Compares DB open trades against cTrader before doing anything else
+    # Catches any SL/TP hits that occurred while bot was offline
+    try:
+        logger.info("MainLoop | Startup reconciliation — DB vs cTrader...")
+        from data_pipeline.connectors.ctrader_rest_api import connector as ct_conn
+        from data_pipeline.storage.timeseries_db import db
+        from sqlalchemy import text as sa_text
+        from execution.risk_manager import risk_manager, _get_current_price
+
+        live_positions = ct_conn.get_open_positions()
+        live_pos_ids   = {str(p["position_id"]) for p in live_positions}
+
+        with db.connection() as conn:
+            db_open = conn.execute(sa_text("""
+                SELECT id, symbol, direction, entry_price,
+                       stop_loss, take_profit, ctrader_position_id
+                FROM trades WHERE status = 'OPEN'
+            """)).fetchall()
+
+        zombies = 0
+        for row in db_open:
+            tid, sym, dirn, entry, sl, tp, ct_pos_id = row
+            if ct_pos_id and str(ct_pos_id) not in live_pos_ids:
+                current = _get_current_price(sym)
+                if dirn == "BUY":
+                    if tp and current >= tp:
+                        exit_price, close_status = tp, "CLOSED_TP"
+                    else:
+                        exit_price, close_status = sl, "CLOSED_SL"
+                else:
+                    if tp and current <= tp:
+                        exit_price, close_status = tp, "CLOSED_TP"
+                    else:
+                        exit_price, close_status = sl, "CLOSED_SL"
+
+                risk_manager.record_trade_close(tid, exit_price, close_status)
+                logger.warning(
+                    f"MainLoop | Startup reconcile: zombie trade {tid} "
+                    f"{sym} → {close_status} @ {exit_price}"
+                )
+                zombies += 1
+
+        if zombies:
+            logger.warning(
+                f"MainLoop | Startup reconcile: fixed {zombies} zombie "
+                f"DB record(s) — positions were closed while bot was offline"
+            )
+        else:
+            logger.success("MainLoop | Startup reconcile: DB in sync with cTrader ✅")
+
+    except Exception as exc:
+        logger.warning(f"MainLoop | Startup reconcile failed: {exc}")
+
     _startup_data_fetch(connector)
     _startup_features()
     _startup_analysts()
@@ -626,6 +1004,7 @@ def main(dry_run: bool = False, status_only: bool = False) -> None:
             balance = account_info.get("balance", 10_000.0)
             equity  = account_info.get("equity",  balance)
             risk_manager.account.update(balance, equity)
+            risk_manager.account.reset_daily()  # set daily_start to live balance
             alerts.send_startup(mode="PAPER", balance=balance)
             logger.success(
                 f"MainLoop | Account: ${balance:,.2f} "

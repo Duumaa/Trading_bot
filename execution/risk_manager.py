@@ -103,7 +103,7 @@ PIP_DECIMALS: Dict[str, int] = {
     "AUDJPY": 2, "NZDJPY": 2,
 }
 
-CACHE_TTL = 300   # 5 min for account state
+CACHE_TTL = 86_400   # 24h — must not expire mid-session or kill switch goes blind
 
 # ══════════════════════════════════════════════════════════════
 # REDIS
@@ -136,9 +136,9 @@ class AccountState:
         from dotenv import load_dotenv
         load_dotenv(str(ROOT / ".env"))
         self.trading_mode = os.getenv("TRADING_MODE", "PAPER")
-        self._balance     = 10_000.0   # paper default
-        self._equity      = 10_000.0
-        self._daily_start = 10_000.0   # balance at start of day
+        self._balance     = 1_774.00   # updated balance — overridden by Redis
+        self._equity      = 1_774.00
+        self._daily_start = 1_774.00   # overridden by Redis daily_start key
         self._r           = None
 
     @property
@@ -147,24 +147,52 @@ class AccountState:
             self._r = _get_redis()
         return self._r
 
-    def get(self) -> Dict[str, float]:
+    def get(self) -> Dict[str, Any]:
         """Get current account state from Redis or defaults."""
         try:
             val = self.r.get("risk:account_state")
             if val:
                 return json.loads(val)
-        except Exception:
-            pass
 
-        # Return defaults for paper trading
-        return {
-            "balance":      self._balance,
-            "equity":       self._equity,
-            "daily_start":  self._daily_start,
-            "daily_pnl":    0.0,
-            "daily_pnl_pct": 0.0,
-            "mode":         self.trading_mode,
-        }
+            # Cache miss — reconstruct from persistent keys rather than returning 0.0
+            ds_raw  = self.r.get("risk:daily_start_balance")
+            bal_raw = self.r.get("risk:session_start_balance")
+
+            daily_start = float(ds_raw)  if ds_raw  else self._balance
+            balance     = float(bal_raw) if bal_raw else self._balance
+
+            daily_pnl     = balance - daily_start
+            daily_pnl_pct = daily_pnl / daily_start if daily_start > 0 else 0.0
+
+            logger.warning(
+                f"AccountState | account_state cache MISS — "
+                f"reconstructed: balance={balance:.2f}, "
+                f"daily_start={daily_start:.2f}, "
+                f"daily_pnl_pct={daily_pnl_pct*100:.2f}%"
+            )
+
+            state = {
+                "balance":       balance,
+                "equity":        balance,
+                "daily_start":   daily_start,
+                "daily_pnl":     round(daily_pnl, 2),
+                "daily_pnl_pct": round(daily_pnl_pct, 6),
+                "mode":          "PAPER",
+            }
+            # Re-cache it so next call is fast
+            self.r.setex("risk:account_state", CACHE_TTL, json.dumps(state))
+            return state
+
+        except Exception as exc:
+            logger.error(f"AccountState.get | {exc}")
+            return {
+                "balance":       self._balance,
+                "equity":        self._balance,
+                "daily_start":   self._balance,
+                "daily_pnl":     0.0,
+                "daily_pnl_pct": 0.0,
+                "mode":          "PAPER",
+            }
 
     def update(self, balance: float, equity: float) -> None:
         """Update account state in Redis."""
@@ -182,6 +210,8 @@ class AccountState:
             "updated_at":    datetime.now(timezone.utc).isoformat(),
         }
         try:
+            # Persist daily_start with no TTL so it survives cache expiry
+            self.r.set("risk:daily_start_balance", str(state["daily_start"]))
             self.r.setex("risk:account_state", CACHE_TTL, json.dumps(new_state))
         except Exception as exc:
             logger.warning(f"RiskManager | Account state cache failed: {exc}")
@@ -189,18 +219,23 @@ class AccountState:
         self._equity  = equity
 
     def reset_daily(self) -> None:
-        """Reset daily P&L tracking (call at start of each trading day)."""
+        """Reset daily P&L tracking and clear kill switch (call at start of each trading day)."""
         state = self.get()
         state["daily_start"]   = state["balance"]
         state["daily_pnl"]     = 0.0
         state["daily_pnl_pct"] = 0.0
         try:
             self.r.setex("risk:account_state", CACHE_TTL, json.dumps(state))
+            # Clear daily kill switch so bot resumes next session
+            self.r.delete("risk:halted")
+            self.r.delete("risk:daily_loss")
+            self.r.set("risk:daily_pnl", "0.0")
+            self.r.set("risk:session_start_balance", str(state["balance"]))
         except Exception:
             pass
-        logger.info(
-            f"RiskManager | Daily P&L reset | "
-            f"Start balance: ${state['balance']:,.2f}"
+        logger.success(
+            f"RiskManager | Daily reset complete | "
+            f"Kill switch cleared | Start balance: ${state['balance']:,.2f}"
         )
 
     def apply_pnl(self, pnl_usd: float) -> None:
@@ -225,9 +260,18 @@ def _get_atr(pair: str) -> float:
         val = r.get(f"features:stat:{pair}")
         if val:
             feats = json.loads(val)
-            atr   = feats.get("atr_14", 0.0)
+            # Prefer M15 ATR for stop sizing (correct for M15 system)
+            # Fall back to D1 ATR / 6 if M15 not available
+            atr_m15 = feats.get("atr_14_m15", 0.0)
+            if atr_m15 > 0:
+                return float(atr_m15)
+            atr = feats.get("atr_14", 0.0)
             if atr > 0:
-                return float(atr)
+                # JPY pairs stored as price×100 in ohlcv — ATR is 100× too large
+                JPY_PAIRS_LOCAL = {"USDJPY","EURJPY","GBPJPY","AUDJPY","NZDJPY"}
+                if pair in JPY_PAIRS_LOCAL:
+                    atr = atr / 100.0
+                return float(atr / 6.0)  # D1 ATR → M15 approximation
     except Exception as exc:
         logger.debug(f"RiskManager | ATR fetch failed {pair}: {exc}")
 
@@ -560,7 +604,6 @@ def _count_open_positions() -> int:
         logger.warning(f"RiskManager | Open position count failed: {exc}")
         return 0
 
-
 def _is_pair_already_open(pair: str) -> bool:
     """Check if we already have an open position in this pair."""
     try:
@@ -572,6 +615,32 @@ def _is_pair_already_open(pair: str) -> bool:
             return int(count or 0) > 0
     except Exception:
         return False
+
+
+def _get_open_positions() -> List[Dict]:
+    """
+    Return list of open positions with pair and margin info.
+    Used by correlation guard.
+    """
+    try:
+        with db.connection() as conn:
+            rows = conn.execute(text("""
+                SELECT symbol, direction, volume_units, entry_price
+                FROM trades
+                WHERE status = 'OPEN'
+            """)).fetchall()
+            return [
+                {
+                    "pair":         r[0],
+                    "direction":    r[1],
+                    "volume_units": r[2],
+                    "margin_used":  (r[2] / CONTRACT_SIZE) * r[3],
+                }
+                for r in rows
+            ]
+    except Exception as exc:
+        logger.warning(f"RiskManager | get_open_positions failed: {exc}")
+        return []
 
 
 # ══════════════════════════════════════════════════════════════
@@ -596,9 +665,79 @@ class RiskManager:
       • Regime size multiplier
     """
 
+    # Pair → (base_currency, quote_currency)
+    _PAIR_CURRENCIES: Dict[str, tuple] = {
+        "EURUSD": ("EUR", "USD"), "GBPUSD": ("GBP", "USD"),
+        "USDJPY": ("USD", "JPY"), "USDCHF": ("USD", "CHF"),
+        "AUDUSD": ("AUD", "USD"), "NZDUSD": ("NZD", "USD"),
+        "USDCAD": ("USD", "CAD"), "EURGBP": ("EUR", "GBP"),
+        "EURJPY": ("EUR", "JPY"), "GBPJPY": ("GBP", "JPY"),
+        "AUDJPY": ("AUD", "JPY"), "NZDJPY": ("NZD", "JPY"),
+    }
+    _MAX_SAME_CURRENCY: int   = 2     # max open pairs sharing any currency
+    _MAX_NET_EXPOSURE_PCT: float = 3.0  # % of account per currency
+
     def __init__(self) -> None:
         self.account = AccountState()
         self._redis  = None
+
+    def check_correlation_guard(
+        self,
+        pair:            str,
+        open_positions:  List[Dict],
+        account_balance: float,
+    ) -> Tuple[bool, str]:
+        """
+        Block a new trade if it would breach currency concentration limits.
+
+        Rules:
+          1. Max 2 open pairs sharing the same currency (e.g. max 2 JPY pairs)
+          2. Net margin exposure per currency ≤ 3% of account balance
+
+        Args:
+            pair:            Proposed new pair e.g. 'AUDJPY'
+            open_positions:  From _get_open_positions() — list of dicts
+            account_balance: Current account equity
+
+        Returns:
+            (allowed: bool, reason: str)
+        """
+        new_currencies = self._PAIR_CURRENCIES.get(pair, ())
+        currency_count: Dict[str, int] = {}
+
+        for pos in open_positions:
+            for ccy in self._PAIR_CURRENCIES.get(pos["pair"], ()):
+                currency_count[ccy] = currency_count.get(ccy, 0) + 1
+
+        # Rule 1 — max 2 pairs sharing the same currency
+        for ccy in new_currencies:
+            current = currency_count.get(ccy, 0)
+            if current >= self._MAX_SAME_CURRENCY:
+                reason = (
+                    f"CORR_GUARD: {ccy} already in "
+                    f"{current} open pair(s) (max {self._MAX_SAME_CURRENCY})"
+                )
+                logger.warning(f"RiskManager | {pair} BLOCKED — {reason}")
+                return False, reason
+
+        # Rule 2 — net currency exposure ≤ 3% per currency
+        if account_balance > 0:
+            for ccy in new_currencies:
+                ccy_exposure = sum(
+                    pos.get("margin_used", 0.0)
+                    for pos in open_positions
+                    if ccy in self._PAIR_CURRENCIES.get(pos["pair"], ())
+                )
+                exposure_pct = (ccy_exposure / account_balance) * 100.0
+                if exposure_pct >= self._MAX_NET_EXPOSURE_PCT:
+                    reason = (
+                        f"CORR_GUARD: {ccy} net exposure "
+                        f"{exposure_pct:.1f}% ≥ {self._MAX_NET_EXPOSURE_PCT}%"
+                    )
+                    logger.warning(f"RiskManager | {pair} BLOCKED — {reason}")
+                    return False, reason
+
+        return True, "OK"
 
     @property
     def r(self):
@@ -668,7 +807,17 @@ class RiskManager:
         if _is_pair_already_open(pair):
             return self._reject(pair, f"DUPLICATE: {pair} already open")
 
-        # ── 7. Regime check ───────────────────────────────────
+        # ── 7. Correlation guard ──────────────────────────────
+        open_positions = _get_open_positions()
+        corr_ok, corr_reason = self.check_correlation_guard(
+            pair            = pair,
+            open_positions  = open_positions,
+            account_balance = account.get("balance", 10_000.0),
+        )
+        if not corr_ok:
+            return self._reject(pair, corr_reason)
+
+        # ── 8. Regime check ───────────────────────────────────
         if regime == "PNS" or size_mult == 0.0:
             return self._reject(pair, "PNS_REGIME: flat required")
 
@@ -835,6 +984,13 @@ class RiskManager:
         Update trade record on close. Calculates P&L.
         Returns pnl_usd.
         """
+        # Normalise long reason strings to fit status VARCHAR(20)
+        STATUS_MAP = {
+            "CLOSED_TECH_INVALIDATION_FLIP":  "CLOSED_TECH_FLIP",
+            "CLOSED_TECH_INVALIDATION_DECAY": "CLOSED_TECH_DECAY",
+        }
+        status = STATUS_MAP.get(status, status)
+
         try:
             with db.connection() as conn:
                 # Fetch trade details
@@ -992,14 +1148,17 @@ class RiskManager:
             logger.error(f"RiskManager | Snapshot failed: {exc}")
 
     # ── Kill switch controls ──────────────────────────────────
-
+    
     def _halt_trading(self, reason: str) -> None:
         """Activate trading halt — writes to Redis."""
         try:
             self.r.set("risk:halted", "true")
             self.r.set("risk:halt_reason", reason)
-            from intelligence.monitoring.telegram_alerts import alerts
-            alerts.send_kill_switch(daily_pnl_pct=0.0, reason=reason)
+            try:
+                from intelligence.monitoring.telegram_alerts import alerts
+                alerts.send_kill_switch(daily_pnl_pct=0.0, reason=reason)
+            except Exception:
+                pass
             logger.critical(
                 f"RiskManager | ⛔ TRADING HALTED: {reason}"
             )
@@ -1009,7 +1168,7 @@ class RiskManager:
     def resume_trading(self) -> None:
         """Manually resume trading after halt. Human approval required."""
         try:
-            self.r.set("risk:halted", "false")
+            self.r.delete("risk:halted")        # ← delete, not set "false"
             self.r.delete("risk:halt_reason")
             logger.warning("RiskManager | ▶ Trading resumed (manual)")
         except Exception as exc:
@@ -1018,9 +1177,16 @@ class RiskManager:
     def is_halted(self) -> bool:
         """Check if trading is currently halted."""
         try:
-            return self.r.get("risk:halted") == "true"
-        except Exception:
+            # Check persistent halt flag
+            if self.r.get("risk:halted") == "true":
+                return True
+            # Also check live P&L directly — catches stale flag misses
+            account = self.account.get()
+            if account.get("daily_pnl_pct", 0.0) <= -DAILY_LOSS_KILL_PCT:
+                return True   # read-only — pre_trade_check() handles the halt
             return False
+        except Exception:
+           return False
 
     @staticmethod
     def _reject(pair: str, reason: str) -> Dict:

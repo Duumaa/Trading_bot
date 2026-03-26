@@ -587,7 +587,14 @@ class CTraderLiveStream:
 
     def _on_connected(self, client: Any) -> None:
         logger.info("LiveStream TCP connected — authenticating...")
+        # App auth may already be done by REST API connector
+        # Try app auth first, if ALREADY_LOGGED_IN skip and go straight to account auth
         self._send_app_auth()
+
+    def _on_app_auth_already_logged_in(self) -> None:
+        """Called when app is already authorized — skip to account auth."""
+        logger.info("LiveStream | App already authorized — sending account auth")
+        self._send_account_auth()
 
     def _on_disconnected(self, client: Any, reason: Any) -> None:
         logger.warning(f"LiveStream disconnected: {reason}")
@@ -645,6 +652,11 @@ class CTraderLiveStream:
         # ── Errors ────────────────────────────────────────────────────────
         elif isinstance(msg, ProtoOAErrorRes):
             logger.error(f"LiveStream error [{msg.errorCode}]: {msg.description}")
+            # ALREADY_LOGGED_IN means app auth already done by REST API
+            # Skip to account auth directly
+            if msg.errorCode == "ALREADY_LOGGED_IN":
+                logger.info("LiveStream | App already authorized — sending account auth")
+                self._send_account_auth()
             with self._response_lock:
                 self._last_response = msg
                 self._response_event.set()
@@ -1034,15 +1046,14 @@ class CTraderLiveStream:
     # =========================================================================
 
     def _get_redis(self):
-        """Get Redis client (lazy init)."""
-        try:
-            import redis
-            host = _get("REDIS_HOST", "localhost")
-            port = int(_get("REDIS_PORT", "6379"))
-            pwd  = _get("REDIS_PASSWORD", "") or None
-            return redis.Redis(host=host, port=port, password=pwd, decode_responses=True)
-        except Exception:
-            return None
+        """Get Redis client (lazy init — shared pool)."""
+        if self._redis_client is None:
+            try:
+                from data_pipeline.storage.redis_pool import redis_client
+                self._redis_client = redis_client
+            except Exception:
+                return None
+        return self._redis_client
 
     def _redis_set_price(self, symbol: str, tick: Tick) -> None:
         """Cache latest price to Redis. Key: price:{SYMBOL}"""

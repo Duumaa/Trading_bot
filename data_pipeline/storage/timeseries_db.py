@@ -315,7 +315,7 @@ class TimescaleDB:
                 (event_time, country, currency, event_name, impact, actual, forecast, previous, source)
             VALUES
                 (:event_time, :country, :currency, :event_name, :impact, :actual, :forecast, :previous, :source)
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (event_time, country, event_name) DO NOTHING
         """)
 
         with self.connection() as conn:

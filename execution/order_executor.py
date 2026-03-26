@@ -336,13 +336,42 @@ class OrderExecutor:
             req.symbolId            = symbol_id
             req.orderType           = ProtoOAOrderType.Value("MARKET")
             req.tradeSide           = ProtoOATradeSide.Value(direction)
-            req.volume              = volume_units
+            req.volume              = volume_units * 100  # cTrader API: 1 unit = 0.01 lots, multiply by 100
             req.timeInForce         = ProtoOATimeInForce.Value("GOOD_TILL_CANCEL")
-            req.stopLoss            = _price_to_ctrader(pair, stop_loss)
-            req.takeProfit          = _price_to_ctrader(pair, take_profit)
+            # MARKET orders require relative SL/TP in points, not absolute prices
+            # Fetch current price from Redis VWAP as entry price reference
+            try:
+                import redis as _redis, os as _os, json as _json
+                _r = _redis.Redis(host="localhost", port=6379,
+                                  password=_os.getenv("REDIS_PASSWORD"), decode_responses=True)
+                _vwap = _json.loads(_r.get(f"features:vwap:{pair}") or "{}")
+                _entry = (_vwap.get("ny_vwap") or _vwap.get("london_vwap") or _vwap.get("tokyo_vwap") or 0.0)
+            except Exception:
+                _entry = 0.0
+
+            if _entry > 0:
+                if pair in JPY_PAIRS and _entry > 1000:
+                    _entry = _entry / 100  # VWAP stored as price×100 for JPY pairs
+                # Round SL/TP to valid tick precision before computing points
+                # JPY pairs: 3 decimal places (0.001 tick)
+                # Non-JPY:   5 decimal places (0.00001 tick)
+                _decimals = 3 if pair in JPY_PAIRS else 5
+                _sl_rounded = round(stop_loss, _decimals)
+                _tp_rounded = round(take_profit, _decimals)
+                _mult = 100000  # cTrader point = 0.00001 for ALL pairs
+                _sl_pts = abs(int(round((_entry - _sl_rounded) * _mult))) if direction == "BUY"                           else abs(int(round((_sl_rounded - _entry) * _mult)))
+                _tp_pts = abs(int(round((_tp_rounded - _entry) * _mult))) if direction == "BUY"                           else abs(int(round((_entry - _tp_rounded) * _mult)))
+                logger.debug(f"OrderExecutor | {pair} SL calc: entry={_entry} sl={stop_loss} tp={take_profit} mult={_mult} sl_pts={_sl_pts} tp_pts={_tp_pts} type={type(_sl_pts)}")
+                req.relativeStopLoss   = max(_sl_pts, 1)
+                req.relativeTakeProfit = max(_tp_pts, 1)
+            else:
+                # Fallback: use fixed points (50 pip SL, 150 pip TP)
+                # cTrader point = 0.00001 for ALL pairs
+                req.relativeStopLoss   = 500000   # 50 pips
+                req.relativeTakeProfit = 1500000  # 150 pips
             req.comment             = ORDER_COMMENT
             req.label               = f"G10-{pair}-{direction[:1]}"
-            req.slippageInPoints    = SLIPPAGE_PIPS * 10  # points = pips × 10
+            # slippageInPoints removed — Pepperstone demo rejects non-zero values
 
         except Exception as exc:
             logger.error(f"OrderExecutor | Request build failed: {exc}")
@@ -471,7 +500,7 @@ class OrderExecutor:
             req = ProtoOAClosePositionReq()
             req.ctidTraderAccountId = self._account_id
             req.positionId          = int(position_id)
-            req.volume              = volume
+            req.volume              = volume * 100  # cTrader API: multiply by 100
 
             response = self.connector._send_request(req)
             result   = _parse_order_response(response, pair)
@@ -545,9 +574,9 @@ class OrderExecutor:
             req.positionId          = int(position_id)
 
             if stop_loss is not None:
-                req.stopLoss = _price_to_ctrader(pair, stop_loss)
+                req.stopLoss = stop_loss
             if take_profit is not None:
-                req.takeProfit = _price_to_ctrader(pair, take_profit)
+                req.takeProfit = take_profit
 
             response = self.connector._send_request(req)
             result   = _parse_order_response(response, pair)
@@ -600,6 +629,134 @@ class OrderExecutor:
         except Exception as exc:
             logger.error(f"OrderExecutor | Sync failed: {exc}")
             return []
+
+    def reconcile_positions(self) -> int:
+        """
+        Sync Redis execution:open:* keys against actual cTrader positions.
+
+        Removes stale Redis keys for positions that were closed in cTrader
+        (hit SL/TP, manually closed, or expired) without the bot noticing.
+        Called at startup and after each M15 bar.
+
+        Returns:
+            Number of stale keys removed.
+        """
+        try:
+            from data_pipeline.connectors.ctrader_rest_api import connector
+            live = connector.get_open_positions()
+            live_ids = {str(p["position_id"]) for p in live}
+
+            removed = 0
+            from execution.signal_aggregator import PAIRS
+            for pair in PAIRS:
+                val = self.r.get(f"execution:open:{pair}")
+                if not val:
+                    continue
+                cached = json.loads(val)
+                pid = str(cached.get("position_id", ""))
+                if pid and pid not in live_ids:
+                    self.r.delete(f"execution:open:{pair}")
+                    logger.info(
+                        f"OrderExecutor | Reconcile: removed stale {pair} "
+                        f"pos_id={pid} (closed in cTrader)"
+                    )
+                    # Update DB trade record — SL/TP hit without bot callback
+                    try:
+                        from execution.risk_manager import risk_manager
+                        from data_pipeline.storage.timeseries_db import db
+                        from sqlalchemy import text as sa_text
+                        trade_db_id = cached.get("trade_db_id")
+                        if trade_db_id:
+                            # Fetch SL price from DB — use it as exit price
+                            # (more accurate than current price which may have moved)
+                            with db.connection() as conn:
+                                row = conn.execute(sa_text("""
+                                    SELECT stop_loss, direction, entry_price
+                                    FROM trades WHERE id = :tid
+                                """), {"tid": trade_db_id}).fetchone()
+
+                            if row:
+                                sl_price  = row[0]
+                                direction = row[1]
+                                entry     = row[2]
+                                # Determine status: was it SL or TP?
+                                # If current price is beyond TP direction → TP hit
+                                # Otherwise → SL hit (conservative default)
+                                close_status = "CLOSED_SL"
+                                risk_manager.record_trade_close(
+                                    trade_db_id, sl_price, close_status
+                                )
+                                logger.info(
+                                    f"OrderExecutor | Reconcile: DB trade "
+                                    f"{trade_db_id} {pair} closed @ {sl_price} "
+                                    f"[{close_status}]"
+                                )
+                    except Exception as e:
+                        logger.warning(f"OrderExecutor | Reconcile DB close failed: {e}")
+                    removed += 1
+
+            # ── DB reconciliation — catch zombie OPEN records ─────────────
+            # Finds DB trades with status=OPEN that cTrader no longer has
+            # This catches SL/TP hits that happened while ticks were down
+            try:
+                from data_pipeline.storage.timeseries_db import db
+                from sqlalchemy import text as sa_text
+                from execution.risk_manager import risk_manager
+
+                with db.connection() as conn:
+                    db_open = conn.execute(sa_text("""
+                        SELECT id, symbol, direction, entry_price,
+                               stop_loss, take_profit,
+                               ctrader_position_id
+                        FROM trades
+                        WHERE status = 'OPEN'
+                    """)).fetchall()
+
+                live_pos_ids = {str(p["position_id"]) for p in live}
+
+                for row in db_open:
+                    tid, sym, dirn, entry, sl, tp, ct_pos_id = row
+                    if ct_pos_id and str(ct_pos_id) not in live_pos_ids:
+                        # Position gone from cTrader — determine exit price
+                        # Use SL as conservative exit (worst case)
+                        # TP check: if price moved past TP direction → TP hit
+                        from execution.risk_manager import _get_current_price
+                        current = _get_current_price(sym)
+
+                        if dirn == "BUY":
+                            if tp and current >= tp:
+                                exit_price   = tp
+                                close_status = "CLOSED_TP"
+                            else:
+                                exit_price   = sl
+                                close_status = "CLOSED_SL"
+                        else:  # SELL
+                            if tp and current <= tp:
+                                exit_price   = tp
+                                close_status = "CLOSED_TP"
+                            else:
+                                exit_price   = sl
+                                close_status = "CLOSED_SL"
+
+                        risk_manager.record_trade_close(tid, exit_price, close_status)
+                        logger.warning(
+                            f"OrderExecutor | DB zombie fixed: "
+                            f"trade {tid} {sym} → {close_status} @ {exit_price}"
+                        )
+
+            except Exception as exc:
+                logger.warning(f"OrderExecutor | DB reconcile failed: {exc}")
+
+            if removed:
+                logger.success(
+                    f"OrderExecutor | Reconcile complete: {removed} stale key(s) removed"
+                )
+            else:
+                logger.debug("OrderExecutor | Reconcile: Redis in sync with cTrader")
+            return removed
+        except Exception as exc:
+            logger.warning(f"OrderExecutor | Reconcile failed: {exc}")
+            return 0
 
     def get_open_positions_local(self) -> List[Dict]:
         """Get open positions from Redis cache (no API call)."""
@@ -664,12 +821,21 @@ class OrderExecutor:
         )
 
         # Build signal data for DB
+        # Extract A4 confidence from gate3 string e.g. "PASS:A4(LONG,conf=0.71)"
+        _a4_conf = None
+        _gate3   = decision.get("gate3", "")
+        if "conf=" in _gate3:
+            try:
+                _a4_conf = float(_gate3.split("conf=")[1].rstrip(")"))
+            except Exception:
+                pass
+
         signal_data = {
             "regime":      regime,
             "regime_conf": decision.get("a2_conf", 0.0),
             "a2_score":    decision.get("a2_score", 0.0),
             "tft_prob":    None,
-            "tsmixer":     None,
+            "tsmixer":     decision.get("a4_conf") or _a4_conf,
             "sentiment":   decision.get("sent_score", 0.0),
             "opus_conv":   decision.get("opus_conv", 0.0),
         }

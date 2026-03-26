@@ -613,14 +613,10 @@ class RSSNewsScraper:
     # =========================================================================
 
     def _get_redis(self):
-        """Lazy Redis connection."""
+        """Lazy Redis connection — shared pool."""
         try:
-            import redis, os
-            host = os.getenv("REDIS_HOST", "localhost")
-            port = int(os.getenv("REDIS_PORT", "6379"))
-            pwd  = os.getenv("REDIS_PASSWORD") or None
-            return redis.Redis(host=host, port=port, password=pwd,
-                               decode_responses=True)
+            from data_pipeline.storage.redis_pool import redis_client
+            return redis_client
         except Exception:
             return None
 

@@ -18,8 +18,8 @@ FIX session config (Pepperstone demo):
   Port:          5201
   SenderCompID:  demo.pepperstone.XXXXXXXX
   TargetCompID:  cServer
-  SenderSubID:   QUOTE
-  TargetSubID:   QUOTE
+  SenderSubID:   TRADE
+  TargetSubID:   TRADE
   BeginString:   FIX.4.4
 
 Redis keys written:
@@ -98,6 +98,7 @@ class FIXTickCollector:
         self._logged_in = threading.Event()
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None  # track running thread
 
         # Tick batch buffer
         self._tick_buffer: List[Dict] = []
@@ -126,12 +127,16 @@ class FIXTickCollector:
 
     def start(self) -> None:
         """Start FIX collector in background daemon thread."""
-        t = threading.Thread(
+        # Guard: don't spawn if thread already alive
+        if self._thread and self._thread.is_alive():
+            logger.warning("FIXCollector | Thread already running — skipping start()")
+            return
+        self._thread = threading.Thread(
             target=self._run_loop,
             name="fix-collector",
             daemon=True
         )
-        t.start()
+        self._thread.start()
         logger.info("FIXCollector | Background thread started")
 
     def stop(self) -> None:
@@ -147,6 +152,16 @@ class FIXTickCollector:
                 time.sleep(1)
             except Exception:
                 pass
+        # Wait for thread to actually exit (max 10s)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=10)
+            if self._thread.is_alive():
+                logger.warning("FIXCollector | Thread did not exit cleanly")
+        self._thread = None
+        self._stop_event.clear()  # reset so next start() works
+        self._logged_in.clear()
+        self._connected.clear()
+        logger.info("FIXCollector | Stopped — ready for restart")
 
     def get_latest_tick(self, pair: str) -> Optional[Dict]:
         """Get latest tick from Redis cache."""
@@ -177,11 +192,17 @@ class FIXTickCollector:
 
                 # Wait for logon
                 if not self._logged_in.wait(timeout=30):
-                    logger.error("FIXCollector | Logon timeout — retrying in 30s")
-                    time.sleep(30)
+                    self._fail_count = getattr(self, '_fail_count', 0) + 1
+                    backoff = min(30 * (2 ** (self._fail_count - 1)), 300)  # 30s, 60s, 120s, 240s, max 300s
+                    logger.error(
+                        f"FIXCollector | Logon timeout "
+                        f"(attempt {self._fail_count}) — retrying in {backoff}s"
+                    )
+                    time.sleep(backoff)
                     continue
 
                 logger.success("FIXCollector | Logged in ✅ — subscribing to 12 pairs")
+                self._fail_count = 0  # reset on successful logon
                 self._subscribe_all()
 
                 # Keep alive — periodic heartbeat check
@@ -196,15 +217,23 @@ class FIXTickCollector:
                 logger.info("FIXCollector | Reconnecting in 30s...")
                 self._logged_in.clear()
                 self._connected.clear()
-                time.sleep(30)
+                time.sleep(30)  # fixed 30s for disconnect (not logon timeout)
 
     def _connect(self) -> None:
         """Create FIX client and start service."""
+        # ── Clean up old client before creating a new one ──
+        if self._client is not None:
+            try:
+                self._client.stopService()
+            except Exception:
+                pass
+            self._client = None
+
         from ctrader_fix import Client
         from twisted.internet import reactor
 
         config = self._build_config()
-        self._client = Client(self._host, self._port, ssl=False)
+        self._client = Client(self._host, self._port, ssl=True, delimiter="\x01")
         self._client.setConnectedCallback(self._on_connected)
         self._client.setDisconnectedCallback(self._on_disconnected)
         self._client.setMessageReceivedCallback(self._on_message)
@@ -239,8 +268,14 @@ class FIXTickCollector:
     def _on_message(self, client: Any, message: Any) -> None:
         """Route all incoming FIX messages."""
         try:
-            pass  # FIX RAW logging disabled in production
+            # Log raw message for diagnostics
+            try:
+                raw = message.getMessage().replace('\x01', '|')
+                logger.debug(f"FIXCollector | RAW: {raw[:200]}")
+            except Exception:
+                pass
             msg_type = message.getFieldValue(35)
+            logger.debug(f"FIXCollector | RAW MSG type={msg_type}")
 
             if msg_type == MSG_LOGON:
                 logger.success("FIXCollector | Logon confirmed ✅")
@@ -562,8 +597,13 @@ class FIXTickCollector:
         """Send FIX Logon (A) message."""
         try:
             from ctrader_fix import LogonRequest
-            config  = self._build_config()
-            logon   = LogonRequest(config)
+            config = self._build_config()
+            logger.debug(f"FIXCollector | Logon config: host={config.get('Host')} "
+                        f"sender={config.get('SenderCompID', '')[:20]} "
+                        f"target={config.get('TargetCompID')} "
+                        f"port={config.get('Port')}")
+            logon = LogonRequest(config)
+            logon.ResetSeqNum = True
             self._client.send(logon)
             logger.debug("FIXCollector | Logon sent")
         except Exception as exc:
@@ -572,11 +612,11 @@ class FIXTickCollector:
     def _send_heartbeat(self, test_req_id: str = "") -> None:
         """Reply to TestRequest with Heartbeat."""
         try:
-            from ctrader_fix import HeartbeatRequest
+            from ctrader_fix import Heartbeat
             config = self._build_config()
-            hb = HeartbeatRequest(config)
-            if test_req_id:
-                hb.setField(112, test_req_id)
+            hb = Heartbeat(config)
+            # ctrader_fix library does not support setField — send plain heartbeat
+            # TestReqID echo omitted; connection keepalive still works
             self._client.send(hb)
         except Exception as exc:
             logger.debug(f"FIXCollector | Heartbeat send failed: {exc}")
@@ -608,7 +648,7 @@ class FIXTickCollector:
         req = MarketDataRequest(config)
         req.MDReqID                 = f"MDR_{self._req_id}_{symbol}"
         req.SubscriptionRequestType = "1"
-        req.MarketDepth             = "1"
+        req.MarketDepth             = "0"
         req.MDUpdateType            = "1"
         req.NoMDEntryTypes          = "1"   # send 1 entry only — bid
         req.MDEntryType             = "0"   # bid only first
@@ -622,7 +662,7 @@ class FIXTickCollector:
         req2 = MarketDataRequest(config)
         req2.MDReqID                 = f"MDR_{self._req_id}_{symbol}_ASK"
         req2.SubscriptionRequestType = "1"
-        req2.MarketDepth             = "1"
+        req2.MarketDepth             = "0"
         req2.MDUpdateType            = "1"
         req2.NoMDEntryTypes          = "1"
         req2.MDEntryType             = "1"   # ask only
@@ -635,33 +675,28 @@ class FIXTickCollector:
     # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _build_config(self) -> Dict:
-        """Build config dict for cTraderFixPy."""
-        return {
-            "Host":          self._host,
-            "Port":          self._port,
-            "SSL":           False,
-            "Username":      self._username,
-            "Password":      self._password,
-            "BeginString":   "FIX.4.4",
-            "SenderCompID":  self._sender,
-            "SenderSubID":   "QUOTE",
-            "TargetCompID":  self._target,
-            "TargetSubID":   "QUOTE",
-            "HeartBeat":     "30",
+    	"""Build config dict for cTraderFixPy."""
+    	return {
+      	    "Host":              self._host,
+            "Port":              self._port,
+            "SSL":               False,
+            "Username":          self._username,
+            "Password":          self._password,
+            "BeginString":       "FIX.4.4",
+            "SenderCompID":      self._sender,
+            "SenderSubID":       _get("CTRADER_FIX_SUB_ID", "TRADE"),
+            "TargetCompID":      self._target,
+            "TargetSubID":       _get("CTRADER_FIX_SUB_ID", "TRADE"),
+            "HeartBeat":         "30",
+            "ResetSeqNumFlag":   "Y",
         }
 
     def _get_redis(self):
-        """Lazy Redis connection."""
+        """Lazy Redis connection — shared pool."""
         if self._redis is None:
-            import redis
-            self._redis = redis.Redis(
-                host=os.getenv("REDIS_HOST", "localhost"),
-                port=int(os.getenv("REDIS_PORT", "6379")),
-                password=os.getenv("REDIS_PASSWORD") or None,
-                decode_responses=True,
-            )
+            from data_pipeline.storage.redis_pool import redis_client
+            self._redis = redis_client
         return self._redis
-
 
 # ── Module singleton ──────────────────────────────────────────────────────────
 fix_collector = FIXTickCollector()

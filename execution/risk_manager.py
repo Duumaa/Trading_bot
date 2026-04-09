@@ -69,7 +69,7 @@ from data_pipeline.storage.timeseries_db import db  # noqa: E402
 # ══════════════════════════════════════════════════════════════
 
 MAX_RISK_PER_TRADE_PCT   = 0.02    # 2% of account per trade
-MAX_CONCURRENT_POSITIONS = 3       # max open trades at once
+MAX_CONCURRENT_POSITIONS = 3       # max directional trades at once (hedges have separate 3-slot cap in hedge_manager)
 DAILY_LOSS_KILL_PCT      = 0.05    # -5% daily → halt trading
 PORTFOLIO_STOP_PCT       = 0.20    # -20% of margin → halt + reassess
 EVENT_BLACKOUT_HOURS     = 2       # flat N hours before HIGH-impact event
@@ -592,17 +592,152 @@ def _check_portfolio_stop(account: Dict) -> Tuple[bool, str]:
 
 
 def _count_open_positions() -> int:
-    """Count currently open positions from DB."""
+    """
+    Count currently open DIRECTIONAL positions from DB.
+    Hedge legs (tracked via hedge:active:* Redis keys) are excluded —
+    they have their own 3-slot cap in hedge_manager.py.
+    """
     try:
         with db.connection() as conn:
             count = conn.execute(text("""
-                SELECT COUNT(*) FROM trades
-                WHERE status = 'OPEN'
+                SELECT COUNT(*) FROM trades WHERE status = 'OPEN'
             """)).scalar()
-            return int(count or 0)
+            db_count = int(count or 0)
+
+        # Subtract ALL hedge legs (2 per pair) — hedges are not directional slots
+        try:
+            r = _get_redis()
+            hedge_pairs = sum(1 for _ in r.scan_iter("hedge:active:*"))
+            db_count = max(0, db_count - hedge_pairs * 2)
+        except Exception:
+            pass
+
+        return db_count
     except Exception as exc:
         logger.warning(f"RiskManager | Open position count failed: {exc}")
         return 0
+
+# Pairs subject to per-session frequency cap
+_SESSION_CAP_PAIRS = {"AUDJPY", "NZDJPY"}
+
+
+def _get_current_session() -> str:
+    """Return current trading session name based on UTC hour."""
+    hour = datetime.now(timezone.utc).hour
+    if hour < 8:
+        return "ASIA"
+    elif hour < 16:
+        return "LONDON"
+    else:
+        return "NY"
+
+
+def _session_ttl_seconds() -> int:
+    """Return seconds remaining until end of the current session."""
+    now  = datetime.now(timezone.utc)
+    hour = now.hour
+    if hour < 8:
+        end_hour = 8
+    elif hour < 16:
+        end_hour = 16
+    else:
+        end_hour = 0   # midnight next day
+
+    if end_hour == 0:
+        from datetime import timedelta as _td
+        end_time = now.replace(hour=0, minute=0, second=0, microsecond=0) + _td(days=1)
+    else:
+        end_time = now.replace(hour=end_hour, minute=0, second=0, microsecond=0)
+
+    return max(int((end_time - now).total_seconds()), 300)  # min 5 min
+
+
+def _is_session_capped(pair: str) -> bool:
+    """Return True if AUDJPY/NZDJPY already has a trade this session."""
+    if pair not in _SESSION_CAP_PAIRS:
+        return False
+    try:
+        r       = _get_redis()
+        session = _get_current_session()
+        return r.exists(f"risk:session_cap:{pair}:{session}") > 0
+    except Exception as exc:
+        logger.debug(f"RiskManager | Session cap check failed {pair}: {exc}")
+        return False
+
+
+def _set_session_cap(pair: str) -> None:
+    """Mark that AUDJPY/NZDJPY has opened a trade this session."""
+    if pair not in _SESSION_CAP_PAIRS:
+        return
+    try:
+        r       = _get_redis()
+        session = _get_current_session()
+        ttl     = _session_ttl_seconds()
+        r.setex(f"risk:session_cap:{pair}:{session}", ttl, "1")
+        logger.warning(
+            f"RiskManager | {pair} SESSION CAP SET — "
+            f"no further {session} trades (TTL={ttl}s)"
+        )
+    except Exception as exc:
+        logger.debug(f"RiskManager | Session cap set failed {pair}: {exc}")
+
+
+def _is_pair_in_sl_cooldown(pair: str, direction: str) -> Tuple[bool, float]:
+    """
+    Check pair cooldown. Behaviour differs by close type:
+
+      CLOSED_SL:        block BOTH directions — 0-2h hard, 2-4h soft (×0.5 conf)
+      CLOSED_TECH_FLIP: block SAME direction only — 0-2h hard, opposite allowed immediately
+    """
+    try:
+        r   = _get_redis()
+        raw = r.get(f"risk:sl_cooldown:{pair}")
+        if not raw:
+            return False, 1.0
+
+        # Parse — support legacy plain ISO string and new JSON format
+        try:
+            data       = json.loads(raw)
+            set_at     = datetime.fromisoformat(data["set_at"])
+            close_type = data.get("type", "CLOSED_SL")
+            closed_dir = data.get("direction", "")
+        except (json.JSONDecodeError, KeyError):
+            set_at     = datetime.fromisoformat(raw)
+            close_type = "CLOSED_SL"
+            closed_dir = ""
+
+        hours_elapsed = (datetime.now(timezone.utc) - set_at).total_seconds() / 3600
+
+        if close_type == "CLOSED_TECH_FLIP":
+            # Directional: only same direction blocked (2h hard), opposite free
+            if direction == closed_dir and hours_elapsed < 2.0:
+                opposite = "SELL" if direction == "BUY" else "BUY"
+                logger.warning(
+                    f"RiskManager | {pair} TECH_FLIP cooldown "
+                    f"({hours_elapsed:.1f}h) — {direction} blocked, "
+                    f"{opposite} allowed"
+                )
+                return True, 0.0
+        else:
+            # CLOSED_SL: block both directions, graduated
+            if hours_elapsed < 2.0:
+                logger.warning(
+                    f"RiskManager | {pair} HARD cooldown "
+                    f"({hours_elapsed:.1f}h elapsed) — blocked"
+                )
+                return True, 0.0
+            elif hours_elapsed < 4.0:
+                mult = 0.50
+                logger.warning(
+                    f"RiskManager | {pair} SOFT cooldown "
+                    f"({hours_elapsed:.1f}h elapsed) — conf×{mult}"
+                )
+                return False, mult
+
+    except Exception as exc:
+        logger.debug(f"RiskManager | SL cooldown check failed {pair}: {exc}")
+    return False, 1.0
+
 
 def _is_pair_already_open(pair: str) -> bool:
     """Check if we already have an open position in this pair."""
@@ -681,26 +816,29 @@ class RiskManager:
         self.account = AccountState()
         self._redis  = None
 
+    # Minimum signal strength to allow a 3rd correlated entry at reduced size
+    _CORR_OVERRIDE_A2_MIN: float  = 0.35   # |A2 score| must exceed this
+    _CORR_OVERRIDE_A4_MIN: float  = 0.65   # A4 confidence must exceed this
+    _CORR_OVERRIDE_SIZE:   float  = 0.25   # size multiplier for 3rd entry
+
     def check_correlation_guard(
         self,
         pair:            str,
         open_positions:  List[Dict],
         account_balance: float,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, float]:
         """
         Block a new trade if it would breach currency concentration limits.
 
         Rules:
-          1. Max 2 open pairs sharing the same currency (e.g. max 2 JPY pairs)
-          2. Net margin exposure per currency ≤ 3% of account balance
-
-        Args:
-            pair:            Proposed new pair e.g. 'AUDJPY'
-            open_positions:  From _get_open_positions() — list of dicts
-            account_balance: Current account equity
+          1. Max 2 open pairs sharing the same currency (e.g. max 2 JPY pairs).
+             Exception: if A2 |score| >= 0.35 AND A4 confidence >= 0.65, a 3rd
+             correlated entry is allowed at 0.25x size.
+          2. Net margin exposure per currency <= 3% of account balance.
 
         Returns:
-            (allowed: bool, reason: str)
+            (allowed: bool, reason: str, size_mult_override: float)
+            size_mult_override is 1.0 normally; 0.25 when 3rd-entry override fires.
         """
         new_currencies = self._PAIR_CURRENCIES.get(pair, ())
         currency_count: Dict[str, int] = {}
@@ -713,14 +851,25 @@ class RiskManager:
         for ccy in new_currencies:
             current = currency_count.get(ccy, 0)
             if current >= self._MAX_SAME_CURRENCY:
+                # Strong signal override: allow 3rd entry at 0.25x
+                a2_score, a4_conf = self._read_signal_strength(pair)
+                if (abs(a2_score) >= self._CORR_OVERRIDE_A2_MIN
+                        and a4_conf >= self._CORR_OVERRIDE_A4_MIN):
+                    logger.info(
+                        f"RiskManager | {pair} CORR_OVERRIDE: "
+                        f"{ccy} at {current} pairs — strong signal "
+                        f"(A2={a2_score:+.2f} A4={a4_conf:.2f}) → 0.25× size"
+                    )
+                    return True, f"CORR_OVERRIDE:{ccy}_3rd_0.25x", self._CORR_OVERRIDE_SIZE
+
                 reason = (
                     f"CORR_GUARD: {ccy} already in "
                     f"{current} open pair(s) (max {self._MAX_SAME_CURRENCY})"
                 )
                 logger.warning(f"RiskManager | {pair} BLOCKED — {reason}")
-                return False, reason
+                return False, reason, 1.0
 
-        # Rule 2 — net currency exposure ≤ 3% per currency
+        # Rule 2 — net currency exposure <= 3% per currency
         if account_balance > 0:
             for ccy in new_currencies:
                 ccy_exposure = sum(
@@ -735,9 +884,27 @@ class RiskManager:
                         f"{exposure_pct:.1f}% ≥ {self._MAX_NET_EXPOSURE_PCT}%"
                     )
                     logger.warning(f"RiskManager | {pair} BLOCKED — {reason}")
-                    return False, reason
+                    return False, reason, 1.0
 
-        return True, "OK"
+        return True, "OK", 1.0
+
+    def _read_signal_strength(self, pair: str) -> Tuple[float, float]:
+        """Read A2 score and A4 confidence from Redis for correlation override check."""
+        a2_score = 0.0
+        a4_conf  = 0.0
+        try:
+            a2_raw = self.r.get(f"features:analyst2:{pair}")
+            if a2_raw:
+                a2_score = float(json.loads(a2_raw).get("score", 0.0))
+        except Exception:
+            pass
+        try:
+            a4_raw = self.r.get(f"features:analyst4:{pair}")
+            if a4_raw:
+                a4_conf = float(json.loads(a4_raw).get("confidence", 0.0))
+        except Exception:
+            pass
+        return a2_score, a4_conf
 
     @property
     def r(self):
@@ -795,21 +962,48 @@ class RiskManager:
         if blackout:
             return self._reject(pair, reason)
 
-        # ── 5. Max concurrent positions ───────────────────────
+        # ── 5. Max concurrent directional positions ───────────
+        # Hedges have their own 3-slot cap — this only counts directional trades
         open_count = _count_open_positions()
         if open_count >= MAX_CONCURRENT_POSITIONS:
             return self._reject(
                 pair,
-                f"MAX_POSITIONS: {open_count}/{MAX_CONCURRENT_POSITIONS} open"
+                f"MAX_DIRECTIONAL: {open_count}/{MAX_CONCURRENT_POSITIONS} directional open"
             )
 
         # ── 6. Duplicate pair ─────────────────────────────────
         if _is_pair_already_open(pair):
             return self._reject(pair, f"DUPLICATE: {pair} already open")
 
+        # ── 6b. SL / Tech-flip cooldown ───────────────────────
+        blocked, conf_mult = _is_pair_in_sl_cooldown(pair, direction)
+        if blocked:
+            return self._reject(pair, f"SL_COOLDOWN: {pair} {direction} blocked after stop-out")
+        if conf_mult < 1.0:
+            # Soft cooldown — pass through but flag for confidence reduction
+            logger.warning(
+                f"RiskManager | {pair} soft cooldown active "
+                f"— confidence will be reduced ×{conf_mult}"
+            )
+            # Store in result so signal_aggregator can apply it
+            # For now: block unless size_mult is already strong
+            if size_mult < 1.0:
+                return self._reject(
+                    pair,
+                    f"SL_SOFTCOOLDOWN: {pair} reduced confidence window"
+                )
+
+        # ── 6c. Session cap (AUDJPY/NZDJPY: max 1 trade per session) ──
+        if _is_session_capped(pair):
+            session = _get_current_session()
+            return self._reject(
+                pair,
+                f"SESSION_CAP: {pair} already traded this {session} session"
+            )
+
         # ── 7. Correlation guard ──────────────────────────────
         open_positions = _get_open_positions()
-        corr_ok, corr_reason = self.check_correlation_guard(
+        corr_ok, corr_reason, corr_size_override = self.check_correlation_guard(
             pair            = pair,
             open_positions  = open_positions,
             account_balance = account.get("balance", 10_000.0),
@@ -829,12 +1023,13 @@ class RiskManager:
             f"daily_pnl={account.get('daily_pnl_pct',0)*100:.2f}%"
         )
         return {
-            "approved":    True,
-            "pair":        pair,
-            "direction":   direction,
-            "account":     account,
-            "open_count":  open_count,
-            "reason":      "ALL_CHECKS_PASSED",
+            "approved":           True,
+            "pair":               pair,
+            "direction":          direction,
+            "account":            account,
+            "open_count":         open_count,
+            "reason":             "ALL_CHECKS_PASSED",
+            "size_mult_override": corr_size_override,   # 1.0 normally; 0.25 on 3rd-entry override
         }
 
     def calculate_position(
@@ -856,9 +1051,25 @@ class RiskManager:
         account = self.account.get()
 
         # Stop loss from ATR
-        stop_loss, take_profit, stop_pips = calculate_stop_from_atr(
+        stop_loss, raw_tp, stop_pips = calculate_stop_from_atr(
             pair, direction, entry_price
         )
+
+        # Snap TP to nearest S/R level (if a wall sits between entry and raw target)
+        try:
+            from features.price_target import price_target_engine
+            take_profit, r_ratio, tp_source = price_target_engine.compute(
+                pair        = pair,
+                direction   = direction,
+                entry_price = entry_price,
+                sl_price    = stop_loss,
+                raw_tp      = raw_tp,
+            )
+        except Exception as _pt_exc:
+            logger.warning(f"RiskManager | price_target snap failed ({_pt_exc}), using raw TP")
+            take_profit = raw_tp
+            r_ratio     = 3.0
+            tp_source   = "ATR_RAW"
 
         # Volume units from risk
         volume_units, sizing = calculate_volume_units(
@@ -877,6 +1088,8 @@ class RiskManager:
             "stop_loss":      stop_loss,
             "take_profit":    take_profit,
             "stop_pips":      stop_pips,
+            "r_ratio":        r_ratio,
+            "tp_source":      tp_source,
             "volume_units":   volume_units,
             "risk_pct":       sizing.get("risk_pct", MAX_RISK_PER_TRADE_PCT),
             "risk_amount_usd": sizing.get("risk_amount_usd", 0.0),
@@ -901,6 +1114,7 @@ class RiskManager:
         signal_data:     Dict,
         fix_order_id:    Optional[str] = None,
         position_id:     Optional[str] = None,
+        entry_type:      Optional[str] = None,
     ) -> Optional[int]:
         """
         Insert trade record into DB on order open.
@@ -922,7 +1136,8 @@ class RiskManager:
                         signal_2_fund_score,
                         signal_3_tft_prob, signal_4_tsmixer,
                         signal_5_sentiment, signal_6_bias,
-                        requested_price, trading_mode
+                        requested_price, trading_mode, signal_path,
+                        entry_type
                     ) VALUES (
                         :fix_id, :pos_id,
                         :symbol, :direction, :volume,
@@ -933,7 +1148,8 @@ class RiskManager:
                         :s2_score,
                         :s3_tft, :s4_tsmixer,
                         :s5_sent, :s6_bias,
-                        :req_price, :mode
+                        :req_price, :mode, :sig_path,
+                        :entry_type
                     )
                     RETURNING id
                 """), {
@@ -958,9 +1174,14 @@ class RiskManager:
                     "s6_bias":      signal_data.get("opus_conv", 0.0),
                     "req_price":    entry_price,
                     "mode":         trading_mode,
+                    "sig_path":     signal_data.get("path", "GATE_1234"),
+                    "entry_type":   entry_type or signal_data.get("entry_type"),
                 })
                 conn.commit()
                 trade_id = result.scalar()
+
+            # Session cap: AUDJPY/NZDJPY max 1 trade per session
+            _set_session_cap(pair)
 
             logger.success(
                 f"RiskManager | Trade recorded: id={trade_id} "
@@ -988,6 +1209,16 @@ class RiskManager:
         STATUS_MAP = {
             "CLOSED_TECH_INVALIDATION_FLIP":  "CLOSED_TECH_FLIP",
             "CLOSED_TECH_INVALIDATION_DECAY": "CLOSED_TECH_DECAY",
+            # Hedge manager close reasons → CLOSED_MANUAL
+            "HEDGE_CYCLE_BUY":    "CLOSED_MANUAL",
+            "HEDGE_CYCLE_SELL":   "CLOSED_MANUAL",
+            "HEDGE_CONVERT_BUY":  "CLOSED_MANUAL",
+            "HEDGE_CONVERT_SELL": "CLOSED_MANUAL",
+            "HEDGE_OPEN_FAIL":    "CLOSED_MANUAL",
+            "HEDGE_LEG_SL":       "CLOSED_MANUAL",
+            "PARTIAL_CLOSE":      "CLOSED_MANUAL",
+            "MANUAL_RESET":       "CLOSED_MANUAL",
+            "MAX_CYCLES":         "CLOSED_MANUAL",
         }
         status = STATUS_MAP.get(status, status)
 
@@ -1043,7 +1274,28 @@ class RiskManager:
                 conn.commit()
 
             # Update account state
+            # Update account state
             self.account.apply_pnl(pnl_usd)
+
+            # Cooldown on SL/tech-flip — prevents overtrading same pair
+            # Postmortem 2026-03-27: 68% of losses = OVERTRADED_PAIR
+            # CLOSED_SL: blocks both directions (0-2h hard, 2-4h soft)
+            # CLOSED_TECH_FLIP: blocks same direction only (2h hard)
+            if status in ("CLOSED_SL", "CLOSED_TECH_FLIP"):
+                try:
+                    _r = _get_redis()
+                    cooldown_payload = json.dumps({
+                        "set_at":    datetime.now(timezone.utc).isoformat(),
+                        "type":      status,
+                        "direction": direction,
+                    })
+                    _r.setex(f"risk:sl_cooldown:{pair}", 14400, cooldown_payload)
+                    logger.warning(
+                        f"RiskManager | {pair} {status} cooldown SET "
+                        f"(direction={direction}) — blocked for 4h"
+                    )
+                except Exception as _exc:
+                    logger.debug(f"RiskManager | SL cooldown set failed: {_exc}")
 
             emoji = "✅" if pnl_usd > 0 else "❌"
             logger.info(

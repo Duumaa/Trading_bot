@@ -244,9 +244,15 @@ class CTraderOpenAPIConnector:
 
         elif isinstance(msg, ProtoOAErrorRes):
             logger.error(f"cTrader error [{msg.errorCode}]: {msg.description}")
-            with self._response_lock:
-                self._last_response = msg
-                self._response_event.set()
+            # ALREADY_LOGGED_IN means app session is alive on server side —
+            # treat it as app auth success and proceed to account auth.
+            if msg.errorCode == "ALREADY_LOGGED_IN":
+                logger.info("ALREADY_LOGGED_IN → app already authed, sending account auth...")
+                self._send_account_auth()
+            else:
+                with self._response_lock:
+                    self._last_response = msg
+                    self._response_event.set()
 
         elif isinstance(msg, (
             ProtoOAGetTrendbarsRes,

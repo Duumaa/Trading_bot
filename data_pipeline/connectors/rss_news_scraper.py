@@ -55,34 +55,34 @@ UTC = timezone.utc
 
 RSS_FEEDS = [
     {
-        "name":     "Reuters Business",
-        "url":      "https://feeds.reuters.com/reuters/businessNews",
-        "priority": 1,
-    },
-    {
         "name":     "ForexLive",
         "url":      "https://www.forexlive.com/feed/",
         "priority": 1,
     },
     {
-        "name":     "FXStreet",
-        "url":      "https://www.fxstreet.com/rss/news",
+        "name":     "Bloomberg Markets",
+        "url":      "https://feeds.bloomberg.com/markets/news.rss",
+        "priority": 1,
+    },
+    {
+        "name":     "CNBC FX",
+        "url":      "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069",
+        "priority": 1,
+    },
+    {
+        "name":     "MarketWatch FX",
+        "url":      "https://feeds.marketwatch.com/marketwatch/marketpulse/",
+        "priority": 2,
+    },
+    {
+        "name":     "WSJ Markets",
+        "url":      "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
         "priority": 2,
     },
     {
         "name":     "Investing.com FX",
         "url":      "https://www.investing.com/rss/news_301.rss",
         "priority": 2,
-    },
-    {
-        "name":     "DailyFX",
-        "url":      "https://www.dailyfx.com/feeds/all",
-        "priority": 2,
-    },
-    {
-        "name":     "MarketWatch FX",
-        "url":      "https://feeds.marketwatch.com/marketwatch/marketpulse/",
-        "priority": 3,
     },
 ]
 
@@ -261,7 +261,9 @@ class RSSNewsScraper:
         self._seen_ids: Set[str] = set()   # in-memory dedup cache
         self._session = requests.Session()
         self._session.headers.update({
-            "User-Agent": "Mozilla/5.0 (compatible; G10Bot/1.0; +https://example.com)"
+            "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept":          "application/rss+xml, application/xml, text/xml, */*",
+            "Accept-Language": "en-US,en;q=0.9",
         })
 
     # =========================================================================

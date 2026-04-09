@@ -306,39 +306,55 @@ class TrailingStopManager:
         new_stage = stage
 
         if direction == "BUY":
-            # Stage 1: Move to breakeven when +1R reached
+            # Stage 1: Breakeven + start trail at 0.5R behind when +1R reached
+            # Changed 2026-03-27: previously trail only started at +2R
+            # Data showed most trades peak at +10-15 pips (avg SL=13 pips)
+            # and never reached +2R — sitting at breakeven then flipping flat
+            # Now: trail immediately from +1R at 0.5R distance
             if profit_r >= 1.0 and stage == STAGE_INITIAL:
-                new_sl    = round(entry + buffer, 5)
-                new_stage = STAGE_BREAKEVEN
+                be_sl        = round(entry + buffer, 5)
+                candidate_sl = round(current_price - risk_dist * 0.5, 5)
+                new_sl       = max(be_sl, candidate_sl)
+                new_stage    = STAGE_BREAKEVEN
                 logger.info(
-                    f"TrailingStop | {pair} → BREAKEVEN "
+                    f"TrailingStop | {pair} → BREAKEVEN+TRAIL "
                     f"(+{profit_r:.2f}R) new_sl={new_sl}"
                 )
 
-            # Stage 2: Start trailing when +2R reached
-            elif profit_r >= 2.0 and stage in (STAGE_INITIAL, STAGE_BREAKEVEN):
-                candidate_sl = round(current_price - risk_dist, 5)
+            # Stage 1 ongoing: keep trailing at 0.5R
+            elif stage == STAGE_BREAKEVEN:
+                candidate_sl = round(current_price - risk_dist * 0.5, 5)
+                if candidate_sl > current_sl:
+                    new_sl = candidate_sl
+                    logger.info(
+                        f"TrailingStop | {pair} trail(0.5R) up: "
+                        f"{current_sl:.5f} → {new_sl:.5f}"
+                    )
+
+            # Stage 2: Tighten trail to 0.3R when +2R reached
+            elif profit_r >= 2.0 and stage == STAGE_INITIAL:
+                candidate_sl = round(current_price - risk_dist * 0.3, 5)
                 if candidate_sl > current_sl:
                     new_sl    = candidate_sl
                     new_stage = STAGE_TRAILING
                     logger.info(
-                        f"TrailingStop | {pair} → TRAILING "
+                        f"TrailingStop | {pair} → TRAIL_TIGHT "
                         f"(+{profit_r:.2f}R) new_sl={new_sl}"
                     )
 
-            # Stage 2 ongoing: keep trailing
+            # Stage 2 ongoing: keep trailing at 0.3R
             elif stage == STAGE_TRAILING:
-                candidate_sl = round(current_price - risk_dist, 5)
+                candidate_sl = round(current_price - risk_dist * 0.3, 5)
                 if candidate_sl > current_sl:
                     new_sl = candidate_sl
                     logger.info(
-                        f"TrailingStop | {pair} trail up: "
+                        f"TrailingStop | {pair} trail(0.3R) up: "
                         f"{current_sl:.5f} → {new_sl:.5f}"
                     )
 
-            # Stage 3: Lock profits when near TP (within 0.5R of TP)
+            # Stage 3: Lock at 0.2R when near TP (within 0.5R of TP)
             if dist_to_tp <= risk_dist * 0.5 and stage in (STAGE_TRAILING, STAGE_BREAKEVEN):
-                candidate_sl = round(current_price - risk_dist * 0.5, 5)
+                candidate_sl = round(current_price - risk_dist * 0.2, 5)
                 if candidate_sl > current_sl:
                     new_sl    = candidate_sl
                     new_stage = STAGE_LOCKING
@@ -347,7 +363,7 @@ class TrailingStopManager:
                         f"(near TP) new_sl={new_sl}"
                     )
             elif stage == STAGE_LOCKING:
-                candidate_sl = round(current_price - risk_dist * 0.5, 5)
+                candidate_sl = round(current_price - risk_dist * 0.2, 5)
                 if candidate_sl > current_sl:
                     new_sl = candidate_sl
                     logger.info(
@@ -355,39 +371,52 @@ class TrailingStopManager:
                         f"{current_sl:.5f} → {new_sl:.5f}"
                     )
 
-        else:  # SELL
-            # Stage 1: Breakeven
+        else:  # SELL — mirror of BUY logic with directions flipped
+            # Stage 1: Breakeven + trail at 0.5R above price
             if profit_r >= 1.0 and stage == STAGE_INITIAL:
-                new_sl    = round(entry - buffer, 5)
-                new_stage = STAGE_BREAKEVEN
+                be_sl        = round(entry - buffer, 5)
+                candidate_sl = round(current_price + risk_dist * 0.5, 5)
+                new_sl       = min(be_sl, candidate_sl)
+                new_stage    = STAGE_BREAKEVEN
                 logger.info(
-                    f"TrailingStop | {pair} → BREAKEVEN "
+                    f"TrailingStop | {pair} → BREAKEVEN+TRAIL "
                     f"(+{profit_r:.2f}R) new_sl={new_sl}"
                 )
 
-            # Stage 2: Trail
-            elif profit_r >= 2.0 and stage in (STAGE_INITIAL, STAGE_BREAKEVEN):
-                candidate_sl = round(current_price + risk_dist, 5)
+            # Stage 1 ongoing: keep trailing at 0.5R
+            elif stage == STAGE_BREAKEVEN:
+                candidate_sl = round(current_price + risk_dist * 0.5, 5)
+                if candidate_sl < current_sl:
+                    new_sl = candidate_sl
+                    logger.info(
+                        f"TrailingStop | {pair} trail(0.5R) down: "
+                        f"{current_sl:.5f} → {new_sl:.5f}"
+                    )
+
+            # Stage 2: Tighten to 0.3R at +2R
+            elif profit_r >= 2.0 and stage == STAGE_INITIAL:
+                candidate_sl = round(current_price + risk_dist * 0.3, 5)
                 if candidate_sl < current_sl:
                     new_sl    = candidate_sl
                     new_stage = STAGE_TRAILING
                     logger.info(
-                        f"TrailingStop | {pair} → TRAILING "
+                        f"TrailingStop | {pair} → TRAIL_TIGHT "
                         f"(+{profit_r:.2f}R) new_sl={new_sl}"
                     )
 
+            # Stage 2 ongoing: trail at 0.3R
             elif stage == STAGE_TRAILING:
-                candidate_sl = round(current_price + risk_dist, 5)
+                candidate_sl = round(current_price + risk_dist * 0.3, 5)
                 if candidate_sl < current_sl:
                     new_sl = candidate_sl
                     logger.info(
-                        f"TrailingStop | {pair} trail down: "
+                        f"TrailingStop | {pair} trail(0.3R) down: "
                         f"{current_sl:.5f} → {new_sl:.5f}"
                     )
 
-            # Stage 3: Lock
+            # Stage 3: Lock at 0.2R near TP
             if dist_to_tp <= risk_dist * 0.5 and stage in (STAGE_TRAILING, STAGE_BREAKEVEN):
-                candidate_sl = round(current_price + risk_dist * 0.5, 5)
+                candidate_sl = round(current_price + risk_dist * 0.2, 5)
                 if candidate_sl < current_sl:
                     new_sl    = candidate_sl
                     new_stage = STAGE_LOCKING
@@ -396,7 +425,7 @@ class TrailingStopManager:
                         f"(near TP) new_sl={new_sl}"
                     )
             elif stage == STAGE_LOCKING:
-                candidate_sl = round(current_price + risk_dist * 0.5, 5)
+                candidate_sl = round(current_price + risk_dist * 0.2, 5)
                 if candidate_sl < current_sl:
                     new_sl = candidate_sl
                     logger.info(

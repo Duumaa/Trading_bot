@@ -6,25 +6,25 @@ Signal Aggregator — Gate Logic Engine
 Wires all 6 analysts into a final LONG/SHORT/FLAT decision per pair.
 This is NOT an ensemble. Each analyst group gates independently.
 
-Gate logic (must pass ALL 3 gates):
-  Gate 1 — FUNDAMENTAL  (Analysts 1 + 2)
-    • Regime ≠ PNS
-    • Analyst 2 bias is LONG_BASE or SHORT_BASE (not NEUTRAL)
-    • Analyst 2 confidence ≥ threshold (default 0.20)
-    • Analyst 1 regime is consistent with direction
-      THV/TLV → trend-follow (agree with A2 direction)
-      MR      → fade (opposing direction allowed)
-      PNS     → FLAT always
+Gate logic (2-gate minimum, 2026-04-07):
+  Gate 1 — FUNDAMENTAL (A1 LightGBM OR HMM)
+    • Entry fires when EITHER A1 or HMM detects THV/TLV trending regime
+    • PNS → always flat regardless
+    • HMM requires conf ≥ 0.40 to lead
+    • MACRO_OVERRIDE: A5+A6 strong conviction on MR → upgrade to TLV (existing)
 
-  Gate 2 — SENTIMENT (Analysts 5 + 6)
-    • Sentiment does NOT actively oppose fundamental direction
-    • Opus conviction ≥ 0.25 AND not opposing (>0.3 conviction)
-    • Both can be NEUTRAL — that passes (abstain = allow)
-    • Only BLOCKS if actively contradicts with high conviction
+  Gate 2 — TECHNICAL (A4: TCN or PatchTSMixer)  [DIRECTION SOURCE + HARD GATE]
+    • A4 now determines trade direction (not A2)
+    • PASS = both models agree | PASS_SINGLE = one model agrees
+    • FAIL = no direction → FLAT
 
-  Gate 3 — TECHNICAL (Analysts 3 + 4)  [OPTIONAL — skipped if unavailable]
-    • When models trained: both must confirm direction
-    • When unavailable: gate auto-passes (paper trading mode)
+  Soft modifiers — reduce size_mult, NEVER block:
+    • A2 opposing directional view   → ×0.80
+    • A5 Groq opposing (conf ≥ 0.30) → ×0.85
+    • A6 Opus opposing (conv ≥ 0.25) → ×0.90
+
+  Gate 4 — ENTRY TIMING (rule-based, still hard gate)
+    • Entry engine score ≥ 0.40 required
 
 Final decision per pair:
   {
@@ -78,12 +78,16 @@ from loguru import logger
 ROOT = Path("/workspaces/Trading_bot")
 sys.path.insert(0, str(ROOT))
 
+from intelligence.apex_framework import apex_framework   # noqa: E402  (import after sys.path)
+
 # ══════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════
 
 PAIRS: List[str] = [
-    "EURUSD", "GBPUSD", "USDJPY", "USDCHF",
+    "EURUSD", "GBPUSD", "USDJPY",
+    # "USDCHF" — SUSPENDED 2026-03-27: 5× MODEL_FAILURE (-$45)
+    # SNB intervention risk makes this pair unmodelable. Re-enable after retrain.
     "AUDUSD", "NZDUSD", "USDCAD", "EURGBP",
     "EURJPY", "GBPJPY", "AUDJPY", "NZDJPY",
 ]
@@ -98,7 +102,23 @@ PAIR_CURRENCIES: Dict[str, Tuple[str, str]] = {
 }
 
 # ── Gate thresholds ───────────────────────────────────────────
-A2_MIN_CONFIDENCE     = 0.20   # Analyst 2 min confidence to trade
+A2_MIN_CONFIDENCE     = 0.20   # Analyst 2 min confidence to trade (default)
+
+# Per-pair minimum confidence overrides — raised for pairs with high MODEL_FAILURE rate
+# USD pairs (USDJPY, USDCAD) raised 2026-03-27 after postmortem: 12 MODEL_FAILUREs, -$115
+PAIR_MIN_CONFIDENCE: Dict[str, float] = {
+    "USDJPY": 0.72,
+    "USDCAD": 0.72,
+    "EURUSD": 0.20,   # default — GBPJPY/EURUSD MODEL_FAILURE were profitable
+    "GBPUSD": 0.20,
+    "AUDUSD": 0.20,
+    "NZDUSD": 0.20,
+    "EURGBP": 0.20,
+    "EURJPY": 0.20,
+    "GBPJPY": 0.20,
+    "AUDJPY": 0.20,
+    "NZDJPY": 0.20,
+}
 # LightGBM per-pair accuracy dampener (from Kaggle training results 2026-03-16)
 # Tier 1 (88–90% accuracy) → 1.00 | Tier 2 (81–83%) → 0.94–0.95
 # Tier 3 (79–81%) → 0.90–0.92
@@ -111,9 +131,27 @@ PAIR_MODEL_QUALITY: Dict[str, float] = {
 }
 
 A2_MIN_SCORE          = 0.20   # |score| must exceed this to be directional
+
+# ── Gate 1 combined (A1 × A2) thresholds ──────────────────────────────────
+# combined_conf = A1_regime_conf × 0.60 + |A2_score| × 0.40
+# Replaces A2 standalone veto: A2 neutral no longer blocks if A1 is confident.
+# Direction deferred to A4 when A2 is neutral (same as existing MR_DEFER path).
+GATE1_MIN_CONF: float = 0.40
+GATE1_PAIR_MIN_CONF: Dict[str, float] = {
+    "USDJPY": 0.52,   # raised — high MODEL_FAILURE rate (postmortem 2026-03-27)
+    "USDCAD": 0.52,   # raised — high MODEL_FAILURE rate
+}
+PASS_QUEUE_THRESHOLD  = 0.55   # below this, entry is queued (not executed) — recovery next bar
 OPUS_BLOCK_CONVICTION = 0.50   # Opus conviction above this actively BLOCKS
 OPUS_MIN_CONVICTION   = 0.25   # Opus conviction below this = abstain (neutral)
 SENT_BLOCK_THRESHOLD  = 0.30   # |sentiment| above this can block if opposing
+
+# ── Macro conviction override thresholds ──────────────────────────────────
+# When A1=MR but A5+A6 strongly agree on direction, override MR → TLV.
+# Both analysts must agree and independently meet their thresholds.
+MACRO_OVERRIDE_SENT_MIN  = 0.20   # |sentiment| minimum for A5 to contribute
+MACRO_OVERRIDE_SENT_CONF = 0.30   # A5 confidence minimum
+MACRO_OVERRIDE_OPUS_CONV = 0.45   # A6 conviction minimum (weekly macro view)
 
 # ── Regime → sizing multiplier ────────────────────────────────
 REGIME_SIZE: Dict[str, float] = {
@@ -136,7 +174,7 @@ REGIME_DIRECTION_RULE: Dict[str, str] = {
 # Set to True when TFT + PatchTSMixer models are trained and deployed
 TECHNICAL_ANALYSTS_AVAILABLE = True
 
-CACHE_TTL_SIGNAL = 900   # 15 min
+CACHE_TTL_SIGNAL = 1200  # 20 min — intentional overlap with M15 cycle to avoid stale-key gap
 
 # ══════════════════════════════════════════════════════════════
 # REDIS
@@ -182,6 +220,22 @@ def _read_regime(r, pair: str) -> Dict:
         "confidence": 0.0,
         "source":     "fallback",
     }
+
+def _read_regime_hmm(r, pair: str) -> Optional[Dict]:
+    """
+    Read HMM regime from Redis (features:regime_hmm:{pair}).
+
+    Returns None if no HMM model trained for this pair (graceful degradation).
+    HMM is a parallel validator — missing = no penalty, not an error.
+    """
+    try:
+        val = r.get(f"features:regime_hmm:{pair}")
+        if val:
+            return json.loads(val)
+    except Exception:
+        pass
+    return None
+
 
 def _update_regime_history(r, pair: str, regime_data: Dict) -> None:
     """
@@ -370,6 +424,46 @@ def _read_entry(r, pair: str) -> Dict:
 # GATE LOGIC
 # ══════════════════════════════════════════════════════════════
 
+def _check_macro_conviction(
+    sentiment_data: Dict,
+    opus_data: Dict,
+) -> Tuple[str, str]:
+    """
+    Evaluate whether A5 (Groq sentiment) + A6 (Opus weekly) have enough
+    combined conviction to override A1's MR regime classification.
+
+    Both analysts must independently meet their thresholds AND agree on
+    direction. If they conflict, return FLAT — do not override.
+
+    Returns: (direction "LONG_BASE"|"SHORT_BASE"|"FLAT", reason_str)
+    """
+    sent_score = sentiment_data.get("sentiment", 0.0)
+    sent_conf  = sentiment_data.get("confidence", 0.0)
+    opus_bias  = opus_data.get("bias", "NEUTRAL")
+    opus_conv  = opus_data.get("conviction", 0.0)
+
+    # A5 must have enough signal and confidence
+    if abs(sent_score) < MACRO_OVERRIDE_SENT_MIN or sent_conf < MACRO_OVERRIDE_SENT_CONF:
+        return "FLAT", ""
+
+    # A6 must have a directional view with sufficient conviction
+    if opus_bias == "NEUTRAL" or opus_conv < MACRO_OVERRIDE_OPUS_CONV:
+        return "FLAT", ""
+
+    # Determine A5 direction
+    a5_dir = "LONG_BASE" if sent_score > 0 else "SHORT_BASE"
+
+    # Both must agree — conflict = no override
+    if a5_dir != opus_bias:
+        return "FLAT", ""
+
+    reason = (
+        f"A5={sent_score:+.2f}(conf={sent_conf:.2f}),"
+        f"A6={opus_bias}(conv={opus_conv:.2f})"
+    )
+    return opus_bias, reason
+
+
 def _gate1_fundamental(
     r,
     regime_data: Dict,
@@ -415,48 +509,72 @@ def _gate1_fundamental(
         else:
             return "PASS:MR_DEFER", "FLAT", regime, size
 
-    # ── THV / TLV — A2 must be strong ────────────────────────────────────
-    if a2_bias == "NEUTRAL" or abs(a2_score) < A2_MIN_SCORE:
-        return "FAIL:A2_NEUTRAL", "FLAT", regime, 0.0
-
-    if a2_conf < A2_MIN_CONFIDENCE:
-        return f"FAIL:A2_LOW_CONF({a2_conf:.2f})", "FLAT", regime, 0.0
-
-    # Determine raw direction from A2
-    raw_direction = a2_bias  # LONG_BASE or SHORT_BASE
-
-    # Apply regime rule
-    rule = REGIME_DIRECTION_RULE.get(regime, "TREND")
+    # ── THV / TLV — combined A1 × A2 single gate ─────────────────────────
+    # A2 NEUTRAL no longer hard-blocks. Gate score = A1_conf × 0.60 + |A2_score| × 0.40.
+    # When A2 has no macro view, A1 regime confidence carries the gate alone.
+    # Direction: A2-derived when directional; deferred to A4 when neutral.
     size = REGIME_SIZE.get(regime, 1.0)
 
-    if rule == "FLAT":
-        return "FAIL:PNS_REGIME", "FLAT", regime, 0.0
+    a2_magnitude  = abs(a2_score) if (a2_bias != "NEUTRAL" and abs(a2_score) >= A2_MIN_SCORE) else 0.0
+    combined_conf = regime_conf * 0.60 + a2_magnitude * 0.40
+    gate1_min     = GATE1_PAIR_MIN_CONF.get(pair, GATE1_MIN_CONF)
 
-    elif rule == "TREND":
-        # Trend-follow: trade in A2 direction
-        direction = raw_direction
-
-    elif rule == "FADE":
-        # MR regime: fade A2 direction (mean revert)
-        direction = (
-            "SHORT_BASE" if raw_direction == "LONG_BASE" else "LONG_BASE"
+    if combined_conf < gate1_min:
+        return (
+            f"FAIL:GATE1({combined_conf:.2f}<{gate1_min:.2f})",
+            "FLAT", regime, 0.0,
         )
 
+    # Determine direction and size multiplier
+    if a2_bias != "NEUTRAL" and abs(a2_score) >= A2_MIN_SCORE:
+        direction = a2_bias          # THV/TLV: trend-follow A2
+        size_mult = size
+    else:
+        direction = "FLAT"           # resolved from A4 in _fundamental_path
+        size_mult = round(size * 0.75, 2)   # no macro backing → 0.75×
+
     # ── Regime stability check ────────────────────────────────────────────
-    # Update history first, then check stability
     _update_regime_history(r, pair, regime_data)
     is_unstable, unstable_reason, gap = _check_regime_stability(r, pair, regime_data)
     if is_unstable:
-        # Don't block — reduce size to 0.25x (quarter size, not skip)
-        # Rationale: signal may still be valid, but regime boundary = higher risk
-        reduced_size = round(size * 0.25, 2)
+        reduced_size = round(size_mult * 0.25, 2)
         logger.warning(
             f"Aggregator | {pair} {unstable_reason} "
-            f"— size reduced {size}x → {reduced_size}x"
+            f"— size reduced {size_mult}x → {reduced_size}x"
         )
-        return f"PASS:UNSTABLE(gap={gap:.2f})", direction, regime, reduced_size
+        tag = "PASS:A2_NEUTRAL_DEFER" if direction == "FLAT" else "PASS"
+        return f"{tag}+UNSTABLE(gap={gap:.2f})", direction, regime, reduced_size
 
-    return "PASS", direction, regime, size
+    if direction == "FLAT":
+        return "PASS:A2_NEUTRAL_DEFER", "FLAT", regime, size_mult
+
+    return "PASS", direction, regime, size_mult
+
+
+def _hmm_regime_tag(hmm_regime: str, a1_regime: str, upgraded: bool) -> str:
+    """
+    Descriptive tag for the gate1b signal field — NOT a gate, purely for postmortem.
+
+    After postmortem accumulates trades we can see:
+      HMM_UPGRADE  — HMM detected trend A1 missed. Did these trades win?
+      A1_LEADS     — A1 detected trend HMM missed. Did these trades win?
+      AGREE        — both models agree on category.
+      SKIP         — no HMM model available.
+
+    This attribution lets us decide later whether to trust A1, HMM, or require both.
+    """
+    if not hmm_regime:
+        return "SKIP"
+    if upgraded:
+        return f"HMM_UPGRADE(a1=MR,hmm={hmm_regime})"
+    TRENDING = {"THV", "TLV"}
+    a1_trend  = a1_regime  in TRENDING
+    hmm_trend = hmm_regime in TRENDING
+    if a1_trend and not hmm_trend:
+        return f"A1_LEADS(a1={a1_regime},hmm={hmm_regime})"
+    if hmm_trend and not a1_trend:
+        return f"HMM_LEADS(hmm={hmm_regime},a1={a1_regime})"   # shouldn't happen post-upgrade
+    return "AGREE"
 
 
 def _gate2_sentiment(
@@ -526,7 +644,11 @@ def _gate3_technical(technical_data: Dict, direction: str) -> str:
     """
     Gate 3: Technical ML confirmation (Analyst 4 — TCN + PatchTSMixer).
     When TECHNICAL_ANALYSTS_AVAILABLE=False: always SKIP.
-    When available: both models must agree with fundamental direction.
+    When available: either model agreeing is sufficient (OR logic).
+      - Both agree  → PASS       (full confidence, unchanged)
+      - One agrees  → PASS_SINGLE (85% confidence, set in analyst4_inference)
+      - Conflict    → FAIL
+      - Neither     → FAIL
     """
     if not technical_data.get("available", False):
         return "SKIP"
@@ -537,7 +659,7 @@ def _gate3_technical(technical_data: Dict, direction: str) -> str:
     tcn_prob     = technical_data.get("tcn_prob", 0.5)
     patch_prob   = technical_data.get("patch_prob", 0.5)
 
-    if a4_gate != "PASS":
+    if a4_gate not in ("PASS", "PASS_SINGLE"):
         return f"FAIL:A4_NOAGREE(tcn={tcn_prob:.2f},patch={patch_prob:.2f})"
 
     if a4_direction == "FLAT":
@@ -548,7 +670,66 @@ def _gate3_technical(technical_data: Dict, direction: str) -> str:
     if a4_norm != direction:
         return f"FAIL:A4_DISAGREES({a4_direction}_vs_{direction})"
 
+    if a4_gate == "PASS_SINGLE":
+        return f"PASS_SINGLE:A4({a4_direction},conf={a4_conf:.2f})"
+
     return f"PASS:A4({a4_direction},conf={a4_conf:.2f})"
+def _apply_soft_modifiers(
+    size: float,
+    direction: str,
+    a2_data: Optional[Dict],
+    sentiment_data: Optional[Dict],
+    opus_data: Optional[Dict],
+) -> Tuple[float, List[str]]:
+    """
+    Apply soft size penalties when A2/A5/A6 oppose the trade direction.
+    These analysts reduce size_mult but never block a trade.
+
+    Penalties (multiplicative):
+      A2 directional macro opposing    → ×0.80
+      A5 Groq opposing (conf ≥ 0.30)  → ×0.85
+      A6 Opus opposing (conv ≥ 0.25)  → ×0.90
+
+    Returns: (new_size_mult, list_of_modifier_reasons)
+    """
+    reasons: List[str] = []
+    mult = size
+
+    def _opposes(bias: str, direction: str) -> bool:
+        if bias == "NEUTRAL":
+            return False
+        return (direction == "LONG_BASE"  and bias == "SHORT_BASE") or \
+               (direction == "SHORT_BASE" and bias == "LONG_BASE")
+
+    if a2_data:
+        a2_bias  = a2_data.get("bias", "NEUTRAL")
+        a2_score = a2_data.get("score", 0.0)
+        if a2_bias != "NEUTRAL" and abs(a2_score) >= A2_MIN_SCORE and _opposes(a2_bias, direction):
+            mult = round(mult * 0.80, 4)
+            reasons.append(f"A2_OPPOSES({a2_bias},score={a2_score:+.2f},×0.80)")
+
+    if sentiment_data:
+        sent_score = sentiment_data.get("sentiment", 0.0)
+        sent_conf  = sentiment_data.get("confidence", 0.0)
+        sent_bias  = (
+            "SHORT_BASE" if sent_score < -SENT_BLOCK_THRESHOLD
+            else "LONG_BASE" if sent_score > SENT_BLOCK_THRESHOLD
+            else "NEUTRAL"
+        )
+        if sent_conf >= 0.30 and _opposes(sent_bias, direction):
+            mult = round(mult * 0.85, 4)
+            reasons.append(f"A5_OPPOSES(score={sent_score:+.2f},conf={sent_conf:.2f},×0.85)")
+
+    if opus_data:
+        opus_bias = opus_data.get("bias", "NEUTRAL")
+        opus_conv = opus_data.get("conviction", 0.0)
+        if opus_conv >= OPUS_MIN_CONVICTION and _opposes(opus_bias, direction):
+            mult = round(mult * 0.90, 4)
+            reasons.append(f"A6_OPPOSES({opus_bias},conv={opus_conv:.2f},×0.90)")
+
+    return mult, reasons
+
+
 def _gate3_entry(entry_data: Dict, direction: str) -> str:
     """
     Gate 3: Price action entry timing (Analyst 4 — EntryEngine).
@@ -558,9 +739,10 @@ def _gate3_entry(entry_data: Dict, direction: str) -> str:
     don't enter at a bad price (extended, wide spread, OBI opposing).
 
     Returns:
-      PASS          — entry_score >= 0.65, enter this bar
-      PASS_WAIT     — entry_score 0.40–0.65, enter but expect slippage
-      FAIL:reason   — entry_score < 0.40, skip this bar entirely
+      PASS            — entry_score >= 0.65, enter this bar
+      PASS_WAIT       — entry_score 0.55–0.65, enter now (marginal but acceptable)
+      PASS_QUEUE      — entry_score 0.40–0.55, do NOT enter, queue for next bar
+      FAIL:reason     — entry_score < 0.40, skip this bar entirely
     """
     if not entry_data.get("available", False):
         # Entry engine not yet computed — allow trade (conservative default)
@@ -568,8 +750,6 @@ def _gate3_entry(entry_data: Dict, direction: str) -> str:
 
     score      = entry_data.get("entry_score", 0.0)
     entry_type = entry_data.get("entry_type", "WAIT")
-    wait       = entry_data.get("wait", True)
-    reason     = entry_data.get("reason", "")
 
     # Hard fail — setup is actively bad
     if score < 0.40:
@@ -579,8 +759,12 @@ def _gate3_entry(entry_data: Dict, direction: str) -> str:
     if score >= 0.65:
         return f"PASS|{entry_type}|score={score:.2f}"
 
-    # Marginal — allow but flag as waiting
-    return f"PASS_WAIT|{entry_type}|score={score:.2f}"
+    # Acceptable entry — execute with awareness of timing risk
+    if score >= PASS_QUEUE_THRESHOLD:
+        return f"PASS_WAIT|{entry_type}|score={score:.2f}"
+
+    # Marginal — queue for next bar, do not execute yet
+    return f"PASS_QUEUE|{entry_type}|score={score:.2f}"
 
 def _compute_confidence(
     a2_data: Dict,
@@ -609,8 +793,12 @@ def _compute_confidence(
     opus_bias    = opus_data.get("bias", "NEUTRAL")
     a2_bias      = a2_data.get("bias", "NEUTRAL")
 
-    # Base: A2 confidence
-    conf = a2_conf * 0.50
+    # Base: A2 confidence when A2 has a view; A1 regime confidence when A2 neutral
+    a2_score_val = a2_data.get("score", 0.0)
+    if a2_bias == "NEUTRAL" or abs(a2_score_val) < A2_MIN_SCORE:
+        conf = regime_conf * 0.50   # A1 carries the base when A2 has no macro view
+    else:
+        conf = a2_conf * 0.50
 
     # Opus boost: aligned and high conviction
     opus_aligned = (
@@ -639,6 +827,52 @@ def _compute_confidence(
     # Conflict penalty
     if conflict_flag == "A2_VS_OPUS_WEAK":
         conf *= 0.85   # -15% for weak conflict
+
+    return float(min(round(conf, 4), 1.0))
+
+
+def _compute_confidence_v2(
+    a4_conf: float,
+    a1_conf: float,
+    hmm_conf: float,
+    hmm_contributed: bool,
+    direction: str,
+    a2_data: Dict,
+    sentiment_data: Optional[Dict],
+    opus_data: Optional[Dict],
+) -> float:
+    """
+    Confidence under 2-gate architecture.
+
+    A4 carries 60% (it is the direction gate).
+    A1 regime confidence: 15%. HMM if it led: +10%.
+    Aligned A2/A5/A6 each add a minor boost.
+    """
+    conf = a4_conf * 0.60 + a1_conf * 0.15
+
+    if hmm_contributed:
+        conf += hmm_conf * 0.10
+
+    a2_bias  = (a2_data or {}).get("bias",  "NEUTRAL")
+    a2_score = (a2_data or {}).get("score", 0.0)
+    a2_c     = (a2_data or {}).get("confidence", 0.0)
+    if a2_bias != "NEUTRAL" and abs(a2_score) >= A2_MIN_SCORE and (
+        (direction == "LONG_BASE"  and a2_bias == "LONG_BASE") or
+        (direction == "SHORT_BASE" and a2_bias == "SHORT_BASE")
+    ):
+        conf += a2_c * 0.15
+
+    sent_score = (sentiment_data or {}).get("sentiment",   0.0)
+    sent_conf  = (sentiment_data or {}).get("confidence",  0.0)
+    if (direction == "LONG_BASE"  and sent_score >  SENT_BLOCK_THRESHOLD) or \
+       (direction == "SHORT_BASE" and sent_score < -SENT_BLOCK_THRESHOLD):
+        conf += sent_conf * 0.05
+
+    opus_bias = (opus_data or {}).get("bias",       "NEUTRAL")
+    opus_conv = (opus_data or {}).get("conviction", 0.0)
+    if (direction == "LONG_BASE"  and opus_bias == "LONG_BASE") or \
+       (direction == "SHORT_BASE" and opus_bias == "SHORT_BASE"):
+        conf += opus_conv * 0.05
 
     return float(min(round(conf, 4), 1.0))
 
@@ -676,18 +910,282 @@ class SignalAggregator:
 
     def evaluate_pair(self, pair: str) -> Dict:
         """
-        Evaluate a single pair through all gates.
-        Returns the full decision dict.
+        Evaluate a single pair.
+
+        Path A     — 4-gate fundamental: A1+A2 → Sentiment → A4 → Entry.
+        Path B-lite— A1 confirms trending regime, A2 neutral, D1+H1+A4 agree.
+                     Fires before Path B when Gate 1 fails only on A2_NEUTRAL.
+                     Stricter entry threshold (0.55 vs Path B's 0.40). tag=A1_TREND_TECH
+        Path B     — Technical confluence: D1+H1+A4 agree regardless of fundamentals.
+                     Fires when Path A returns FLAT and Path B-lite didn't fire. tag=TECH_CONFLUENCE
+        Recovery   — When PASS_QUEUE queued a signal last bar, re-check and execute if
+                     entry score improved to ≥ 0.55. tag=PASS_WAIT_RECOVERY
         """
-        # Load all analyst data
+        # 0a. Skip pairs managed by hedge_manager (perpetual hedge mode)
+        if self.r.get(f"hedge:active:{pair}"):
+            d = {"pair": pair, "action": "FLAT", "reason": "HEDGE_ACTIVE",
+                 "confidence": 0.0, "size_multiplier": 0.0}
+            self._cache(pair, d)
+            return d
+
+        # 0. Check PASS_WAIT recovery queue (queued from previous bar)
+        recovery = self._check_recovery_queue(pair)
+        if recovery is not None:
+            self._cache(pair, recovery)
+            return recovery
+
+        # 1. Run Path A
+        decision = self._fundamental_path(pair)
+
+        # 1b. PASS_QUEUE: entry score 0.40–0.55 — queue and return FLAT
+        if decision["action"] != "FLAT":
+            gate4 = decision.get("gate4", "")
+            if gate4.startswith("PASS_QUEUE"):
+                self._set_watch_queue(pair, decision)
+                flat_d = dict(decision)
+                flat_d["action"] = "FLAT"
+                flat_d["reason"] = f"PASS_QUEUE: entry marginal ({gate4}), watching next bar"
+                self._cache(pair, flat_d)
+                return flat_d
+
+        if decision["action"] == "FLAT":
+            # 2a. Path B-lite: fundamental model sees trend but A4 failed or entry low.
+            # Try when A1 LightGBM OR HMM regime was trending (Gate 1 passed but Gate 2+ failed).
+            regime  = decision.get("regime", "?")
+            hmm_reg = decision.get("hmm_regime", "")
+            if regime in ("THV", "TLV") or hmm_reg in ("THV", "TLV"):
+                blit = self._path_b_lite(pair)
+                if blit is not None:
+                    self._cache(pair, blit)
+                    return blit
+
+            # 2b. Path B: full technical confluence (all A1/A2 fail cases)
+            tc = self._technical_confluence_path(pair)
+            if tc is not None:
+                self._cache(pair, tc)
+                return tc
+
+        return decision
+
+    # ── PASS_WAIT recovery queue ──────────────────────────────────────────────
+
+    def _set_watch_queue(self, pair: str, decision: Dict) -> None:
+        """Store pair in PASS_QUEUE watch — re-check next bar."""
+        watch_data = {
+            "direction": decision.get("direction"),
+            "regime":    decision.get("regime"),
+            "a2_score":  decision.get("a2_score"),
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.r.setex(f"signal:watch:{pair}", 1800, json.dumps(watch_data))
+        logger.debug(
+            f"Aggregator | {pair} PASS_QUEUE: "
+            f"entry {decision.get('gate4', '?')} — watching next bar"
+        )
+
+    def _check_recovery_queue(self, pair: str) -> Optional[Dict]:
+        """
+        If pair is in watch queue and entry score now ≥ 0.55, execute recovery.
+
+        Re-runs the full fundamental path — gates must still pass. Only the
+        entry score gating changes (accept PASS_WAIT that was previously PASS_QUEUE).
+        """
+        if not self.r.get(f"signal:watch:{pair}"):
+            return None
+
+        # Re-evaluate fundamental path fresh
+        decision = self._fundamental_path(pair)
+
+        if decision["action"] == "FLAT":
+            # Fundamentals degraded — discard queue
+            self.r.delete(f"signal:watch:{pair}")
+            return None
+
+        gate4 = decision.get("gate4", "")
+
+        if gate4.startswith("PASS_QUEUE"):
+            # Entry still marginal — stay queued (TTL handles expiry)
+            logger.debug(
+                f"Aggregator | {pair}: recovery pending, "
+                f"entry score still {decision.get('entry_score', 0):.2f}"
+            )
+            return None
+
+        if gate4.startswith("FAIL"):
+            # Entry got worse — abandon queue
+            self.r.delete(f"signal:watch:{pair}")
+            return None
+
+        # Gate4 is PASS or PASS_WAIT — entry improved, execute
+        self.r.delete(f"signal:watch:{pair}")
+        decision["path"]   = "PASS_WAIT_RECOVERY"
+        decision["reason"] = decision.get("reason", "") + " [RECOVERY]"
+        logger.info(
+            f"Aggregator | {pair} RECOVERY: "
+            f"entry improved → {gate4} — executing"
+        )
+        return decision
+
+    # ── Path B-lite: A1 trend confirmed, A2 neutral ───────────────────────────
+
+    def _path_b_lite(self, pair: str) -> Optional[Dict]:
+        """
+        Path B-lite (tag: A1_TREND_TECH).
+
+        Fires when A1 confirms a trending regime (THV/TLV) but A2 has no macro
+        signal (neutral score), AND D1+H1+A4 all agree on direction.
+
+        Stricter than full Path B:
+          - Regime gate: THV or TLV only (trending confirmed by A1)
+          - Entry threshold: 0.55 (vs 0.40 for Path B)
+          - Base confidence: 0.65 (vs 0.62 for Path B)
+        Size: 0.75× (same as Path B — no A2 macro backing).
+        """
+        try:
+            stat_raw = self.r.get(f"features:stat:{pair}")
+            if not stat_raw:
+                return None
+            stat_data = json.loads(stat_raw)
+
+            d1_trend = int(stat_data.get("d1_trend_dir", 0))
+            h1_trend = int(stat_data.get("h1_trend_dir", 0))
+            d1_slope = float(stat_data.get("d1_ema20_slope", 0.0))
+            h1_slope = float(stat_data.get("h1_ema20_slope", 0.0))
+
+            if d1_trend == 0 or h1_trend == 0 or d1_trend != h1_trend:
+                return None
+
+            tc_direction = "LONG_BASE" if d1_trend == 1 else "SHORT_BASE"
+            action       = "LONG"      if d1_trend == 1 else "SHORT"
+
+            tech_data = _read_technical(self.r, pair)
+            if not tech_data:
+                return None
+
+            a4_dir     = tech_data.get("direction", "FLAT")
+            a4_gate    = tech_data.get("gate", "FAIL")
+            tcn_prob   = float(tech_data.get("tcn_prob",   0.5))
+            patch_prob = float(tech_data.get("patch_prob", 0.5))
+
+            if a4_gate != "PASS" or a4_dir != action:
+                return None
+            if action == "LONG"  and (tcn_prob < 0.52 or patch_prob < 0.52):
+                return None
+            if action == "SHORT" and (tcn_prob > 0.48 or patch_prob > 0.48):
+                return None
+
+            # Stricter entry threshold (0.55 vs Path B's 0.40)
+            entry_data  = _read_entry(self.r, pair)
+            entry_score = float(entry_data.get("entry_score", 0.0))
+            entry_type  = entry_data.get("entry_type", "WAIT")
+
+            if entry_score < 0.55:
+                return None
+            if entry_type == "BLOCKED_SR":
+                return None
+
+            regime_data = _read_regime(self.r, pair)
+            regime      = regime_data.get("regime", "?")
+            a2_data     = _read_analyst2(self.r, pair)
+
+            # HMM tag — observability only on bypass paths (no gate)
+            hmm_raw_bl    = _read_regime_hmm(self.r, pair)
+            hmm_regime_bl = (hmm_raw_bl or {}).get("regime", "")
+            hmm_conf_bl   = round((hmm_raw_bl or {}).get("confidence", 0.0), 4)
+            g1b_bl        = _hmm_regime_tag(hmm_regime_bl, regime, False)
+
+            # Confidence: higher base (0.65) because A1 regime confirmed
+            slope_boost = min(0.05, abs(d1_slope) * 0.01 + abs(h1_slope) * 0.02)
+            a4_boost    = (abs(tcn_prob - 0.5) + abs(patch_prob - 0.5)) * 0.1
+            confidence  = round(min(0.80, 0.65 + slope_boost + a4_boost), 4)
+
+            try:
+                apex_ctx = {
+                    "a2_fund_score": a2_data.get("score", 0.0),
+                    "a1_confidence": regime_data.get("confidence", 0.0),
+                    "a1_regime":     regime,
+                    "a5_sentiment":  0.0,
+                    "direction":     "LONG" if tc_direction == "LONG_BASE" else "SHORT",
+                }
+                apex_mult, apex_reasons = apex_framework.get_penalty(pair, apex_ctx)
+                if apex_mult < 1.0:
+                    confidence = round(confidence * apex_mult, 4)
+            except Exception:
+                apex_mult    = 1.0
+                apex_reasons = []
+
+            now = datetime.now(timezone.utc).isoformat()
+
+            logger.info(
+                f"Aggregator | {pair} PATH-BL A1_TREND_TECH: {action} "
+                f"regime={regime} D1={d1_slope:+.3f}% H1={h1_slope:+.3f}% "
+                f"A4={a4_dir} tcn={tcn_prob:.2f} patch={patch_prob:.2f} "
+                f"entry={entry_score:.2f} conf={confidence:.2f}"
+            )
+
+            return {
+                "pair":         pair,
+                "action":       action,
+                "direction":    tc_direction,
+                "confidence":   confidence,
+                "size_mult":    0.75,
+                "gate1":        f"PASS:A1_ONLY(regime={regime})",
+                "gate2":        "BYPASS:A2_NEUTRAL",
+                "gate3":        f"PASS:A4({a4_dir},tcn={tcn_prob:.2f},patch={patch_prob:.2f})",
+                "gate4":        f"PASS:ENTRY({entry_score:.2f})",
+                "entry_score":  round(entry_score, 4),
+                "entry_type":   entry_type,
+                "entry_reason": entry_data.get("reason", ""),
+                "regime":       regime,
+                "hmm_regime":   hmm_regime_bl,
+                "hmm_conf":     hmm_conf_bl,
+                "gate1b":       g1b_bl,
+                "a2_score":     round(a2_data.get("score", 0.0), 4),
+                "a2_bias":      a2_data.get("bias", "NEUTRAL"),
+                "a2_conf":      round(a2_data.get("confidence", 0.0), 4),
+                "opus_bias":    "NEUTRAL",
+                "opus_conv":    0.0,
+                "sent_bias":    "NEUTRAL",
+                "sent_score":   0.0,
+                "tcn_prob":     round(tcn_prob,   4),
+                "patch_prob":   round(patch_prob, 4),
+                "a4_conf":      round(tech_data.get("confidence", 0.0), 4),
+                "conflict":     "",
+                "apex_mult":    apex_mult,
+                "apex_reasons": apex_reasons,
+                "path":         "A1_TREND_TECH",
+                "reason": (
+                    f"PATH-BL | regime={regime} D1={d1_slope:+.3f}% "
+                    f"H1={h1_slope:+.3f}% A4={a4_dir} entry={entry_score:.2f}"
+                ),
+                "updated_at":   now,
+            }
+
+        except Exception as exc:
+            logger.warning(f"Aggregator | {pair} Path B-lite failed: {exc}")
+            return None
+
+    def _fundamental_path(self, pair: str) -> Dict:
+        """
+        Path A: 2-gate fundamental + technical evaluation (2026-04-07).
+
+        Entry fires when ANY paired condition is met:
+          • A1 LightGBM trending (THV/TLV) + A4 (TCN or PatchTSMixer) directional
+          • HMM trending (THV/TLV, conf≥0.40) + A4 (TCN or PatchTSMixer) directional
+
+        A2/A5/A6 are SOFT size modifiers only — reduce size_mult when opposing, never block.
+        Gate 4 (entry engine) is still a hard gate.
+        Direction is always determined by A4 (the required technical gate).
+        Exception: MACRO_OVERRIDE (A5+A6 on MR) sets direction from macro consensus.
+        """
+        # ── Load all analyst data ─────────────────────────────────────────────
         regime_data    = _read_regime(self.r, pair)
         a2_data        = _read_analyst2(self.r, pair)
         sentiment_data = _read_sentiment(self.r, pair)
         opus_data      = _read_opus_pair(self.r, pair)
-        
-        # ── Opus staleness + conflict guard ──────────────────────────────
+
+        # ── Opus staleness + conflict guard ──────────────────────────────────
         _opus_generated = opus_data.get("generated_at", "")
-        # Fallback: pair keys don't have generated_at — check weekly key
         if not _opus_generated:
             try:
                 _weekly = self.r.get("features:opus:weekly")
@@ -696,7 +1194,6 @@ class SignalAggregator:
                     _opus_generated = _j.loads(_weekly).get("generated_at", "")
             except Exception:
                 pass
-
         _opus_age_days = 999
         if _opus_generated:
             try:
@@ -710,7 +1207,6 @@ class SignalAggregator:
             logger.warning(f"Aggregator | {pair}: Opus {_opus_age_days}d old → NEUTRAL")
             opus_data = {"bias": "NEUTRAL", "conviction": 0.0}
         else:
-            # Conflict check: opus vs yield trend direction
             try:
                 _yf = self.r.get(f"features:yield:{pair}")
                 if _yf:
@@ -732,122 +1228,461 @@ class SignalAggregator:
                         opus_data["conviction"] = _oconv * 0.5
             except Exception as _e:
                 logger.warning(f"Aggregator | {pair}: Opus conflict check failed: {_e}")
-        # ── end guard ─────────────────────────────────────────────────────
-        tech_data      = _read_technical(self.r, pair)
-        entry_data     = _read_entry(self.r, pair)
 
-        now = datetime.now(timezone.utc).isoformat()
+        tech_data  = _read_technical(self.r, pair)
+        entry_data = _read_entry(self.r, pair)
+        now        = datetime.now(timezone.utc).isoformat()
 
-        # ── Gate 1: Fundamental ───────────────────────────────
-        g1_result, direction, regime, size_mult = _gate1_fundamental(
-            self.r,
-            regime_data, a2_data, pair
+        # ── HMM regime ────────────────────────────────────────────────────────
+        hmm_raw        = _read_regime_hmm(self.r, pair)
+        hmm_regime     = (hmm_raw or {}).get("regime", "")
+        hmm_conf       = round((hmm_raw or {}).get("confidence", 0.0), 4)
+        a1_regime_raw  = regime_data.get("regime", "")
+        a1_regime_conf = regime_data.get("confidence", 0.0)
+
+        _update_regime_history(self.r, pair, regime_data)
+
+        # ── PNS: always flat ─────────────────────────────────────────────────
+        if a1_regime_raw == "PNS":
+            g1b = _hmm_regime_tag(hmm_regime, a1_regime_raw, False)
+            decision = self._flat_decision(
+                pair, "FAIL:PNS_REGIME", "MODIFIER:SKIP", "SKIP",
+                regime_data, a2_data, opus_data, sentiment_data, "PNS", now,
+                hmm_regime=hmm_regime, gate1b=g1b,
+            )
+            self._cache(pair, decision)
+            return decision
+
+        # ── Gate 1: At least one fundamental model sees trending regime ───────
+        # Either A1 LightGBM OR HMM detecting THV/TLV is enough to pass.
+        TRENDING     = {"THV", "TLV"}
+        a1_trending  = a1_regime_raw in TRENDING
+        hmm_trending = hmm_regime in TRENDING and hmm_conf >= 0.40
+        hmm_upgraded = not a1_trending and hmm_trending
+        g1b_result   = _hmm_regime_tag(hmm_regime, a1_regime_raw, hmm_upgraded)
+
+        if a1_trending:
+            effective_regime = a1_regime_raw
+            g1_result        = f"PASS:A1({a1_regime_raw},conf={a1_regime_conf:.2f})"
+        elif hmm_trending:
+            effective_regime = hmm_regime
+            g1_result        = f"PASS:HMM({hmm_regime},conf={hmm_conf:.2f})"
+            logger.info(
+                f"Aggregator | {pair} HMM_LEADS: A1={a1_regime_raw} → "
+                f"HMM={hmm_regime}(conf={hmm_conf:.2f})"
+            )
+        else:
+            # Neither sees trend — try MACRO_OVERRIDE (A5+A6 strong on MR)
+            if a1_regime_raw == "MR":
+                macro_dir, macro_reason = _check_macro_conviction(sentiment_data, opus_data)
+                if macro_dir != "FLAT":
+                    # Direction from A5+A6. A4 must confirm. A2 is soft modifier.
+                    effective_regime = "TLV"
+                    g1_result        = f"PASS:MACRO_OVERRIDE({macro_reason})"
+                    direction        = macro_dir
+                    base_size        = REGIME_SIZE["TLV"]
+                    logger.info(
+                        f"Aggregator | {pair} MACRO_OVERRIDE: MR → TLV "
+                        f"dir={macro_dir} [{macro_reason}]"
+                    )
+
+                    # A4 must confirm MACRO_OVERRIDE direction
+                    g3_ml = _gate3_technical(tech_data, direction)
+                    if g3_ml.startswith("FAIL"):
+                        decision = self._flat_decision(
+                            pair, g1_result, "MODIFIER:MACRO_OVERRIDE", g3_ml,
+                            regime_data, a2_data, opus_data, sentiment_data,
+                            "A4_BLOCK", now, hmm_regime=hmm_regime, gate1b=g1b_result,
+                        )
+                        self._cache(pair, decision)
+                        return decision
+
+                    # Stability check
+                    is_unstable, unstable_reason, gap = _check_regime_stability(
+                        self.r, pair, regime_data
+                    )
+                    if is_unstable:
+                        base_size = round(base_size * 0.25, 2)
+                        g1_result += f"+UNSTABLE(gap={gap:.2f})"
+
+                    # Soft modifier: A2 only (A5/A6 confirmed direction for MACRO_OVERRIDE)
+                    size_mult, mod_reasons = _apply_soft_modifiers(
+                        base_size, direction, a2_data, None, None
+                    )
+                    g2_result = f"MODIFIER:{','.join(mod_reasons) if mod_reasons else 'ALIGNED'}"
+
+                    # Gate 4: entry engine
+                    g4_result = _gate3_entry(entry_data, direction)
+                    if g4_result.startswith("FAIL"):
+                        decision = self._flat_decision(
+                            pair, g1_result, g2_result, g3_ml,
+                            regime_data, a2_data, opus_data, sentiment_data,
+                            "TECH_BLOCK", now, hmm_regime=hmm_regime, gate1b=g1b_result,
+                            gate4=g4_result,
+                            entry_score=entry_data.get("entry_score", 0.0),
+                            entry_type=entry_data.get("entry_type", ""),
+                        )
+                        self._cache(pair, decision)
+                        return decision
+
+                    tcn_prob   = tech_data.get("tcn_prob",   0.5)
+                    patch_prob = tech_data.get("patch_prob", 0.5)
+                    a4_conf    = tech_data.get("confidence", 0.0)
+                    confidence = _compute_confidence_v2(
+                        a4_conf, a1_regime_conf, hmm_conf, hmm_upgraded,
+                        direction, a2_data, sentiment_data, opus_data,
+                    )
+                    confidence = round(confidence * PAIR_MODEL_QUALITY.get(pair, 1.0), 4)
+                    apex_ctx = {
+                        "a2_fund_score": a2_data.get("score", 0.0),
+                        "a1_confidence": a1_regime_conf,
+                        "a1_regime":     a1_regime_raw,
+                        "a5_sentiment":  sentiment_data.get("sentiment", 0.0),
+                        "direction":     "LONG" if direction == "LONG_BASE" else "SHORT",
+                    }
+                    try:
+                        apex_mult, apex_reasons = apex_framework.get_penalty(pair, apex_ctx)
+                        if apex_mult < 1.0:
+                            confidence = round(confidence * apex_mult, 4)
+                    except Exception:
+                        apex_mult, apex_reasons = 1.0, []
+
+                    action   = "LONG" if direction == "LONG_BASE" else "SHORT"
+                    mod_str  = " | ".join(mod_reasons) if mod_reasons else "ALL_ALIGNED"
+                    decision = {
+                        "pair": pair, "action": action, "direction": direction,
+                        "confidence": confidence, "size_mult": size_mult,
+                        "gate1": g1_result, "gate1b": g1b_result,
+                        "gate2": g2_result, "gate3": g3_ml, "gate4": g4_result,
+                        "entry_score":    round(entry_data.get("entry_score", 0.0), 4),
+                        "entry_type":     entry_data.get("entry_type", "WAIT"),
+                        "entry_reason":   entry_data.get("reason", ""),
+                        "regime":         effective_regime,
+                        "hmm_regime":     hmm_regime, "hmm_conf": hmm_conf,
+                        "a2_score":       round(a2_data.get("score", 0.0), 4),
+                        "a2_bias":        a2_data.get("bias", "NEUTRAL"),
+                        "a2_conf":        round(a2_data.get("confidence", 0.0), 4),
+                        "opus_bias":      opus_data.get("bias", "NEUTRAL"),
+                        "opus_conv":      round(opus_data.get("conviction", 0.0), 4),
+                        "sent_bias":      sentiment_data.get("bias", "NEUTRAL"),
+                        "sent_score":     round(sentiment_data.get("sentiment", 0.0), 4),
+                        "tcn_prob":       round(tcn_prob, 4),
+                        "patch_prob":     round(patch_prob, 4),
+                        "a4_conf":        round(a4_conf, 4),
+                        "size_modifiers": mod_reasons,
+                        "conflict":       "",
+                        "apex_mult":      apex_mult, "apex_reasons": apex_reasons,
+                        "reason": f"MACRO_OVERRIDE | {action} | {mod_str}",
+                        "updated_at":     now,
+                    }
+                    self._cache(pair, decision)
+                    return decision
+
+            decision = self._flat_decision(
+                pair,
+                f"FAIL:NO_TREND(A1={a1_regime_raw},HMM={hmm_regime or 'N/A'})",
+                "MODIFIER:SKIP", "SKIP",
+                regime_data, a2_data, opus_data, sentiment_data, "NO_TREND", now,
+                hmm_regime=hmm_regime, gate1b=g1b_result,
+            )
+            self._cache(pair, decision)
+            return decision
+
+        # ── Gate 2 (A4 Technical): direction source + hard gate ───────────────
+        # A4 (TCN or PatchTSMixer) determines trade direction.
+        # Passes on PASS (both agree) or PASS_SINGLE (one agrees).
+        a4_gate    = tech_data.get("gate",       "FAIL")
+        a4_dir     = tech_data.get("direction",  "FLAT")
+        tcn_prob   = tech_data.get("tcn_prob",   0.5)
+        patch_prob = tech_data.get("patch_prob", 0.5)
+        a4_conf    = tech_data.get("confidence", 0.0)
+
+        if (not tech_data.get("available", False)
+                or a4_gate not in ("PASS", "PASS_SINGLE")
+                or a4_dir == "FLAT"):
+            g3_ml = f"FAIL:A4(gate={a4_gate},dir={a4_dir})"
+            decision = self._flat_decision(
+                pair, g1_result, "MODIFIER:SKIP", g3_ml,
+                regime_data, a2_data, opus_data, sentiment_data, "A4_BLOCK", now,
+                hmm_regime=hmm_regime, gate1b=g1b_result,
+            )
+            self._cache(pair, decision)
+            return decision
+
+        direction = "LONG_BASE" if a4_dir == "LONG" else "SHORT_BASE"
+        g3_ml     = (
+            f"PASS_SINGLE:A4({a4_dir},tcn={tcn_prob:.2f},patch={patch_prob:.2f})"
+            if a4_gate == "PASS_SINGLE"
+            else f"PASS:A4({a4_dir},tcn={tcn_prob:.2f},patch={patch_prob:.2f})"
         )
 
-        if not g1_result.startswith("PASS"):
-            decision = self._flat_decision(
-                pair, g1_result, "PASS_SKIPPED", "SKIP",
-                regime_data, a2_data, opus_data, sentiment_data,
-                g1_result, now
-            )
-            self._cache(pair, decision)
-            return decision
+        # ── Soft modifiers: A2, A5, A6 (reduce size_mult, never block) ────────
+        base_size = REGIME_SIZE.get(effective_regime, 1.0)
 
-        # ── Gate 2: Sentiment ─────────────────────────────────
-        g2_result, conflict_flag = _gate2_sentiment(
-            sentiment_data, opus_data, direction
+        is_unstable, unstable_reason, gap = _check_regime_stability(
+            self.r, pair, regime_data
         )
+        if is_unstable:
+            base_size = round(base_size * 0.25, 2)
+            logger.warning(
+                f"Aggregator | {pair} {unstable_reason} — base size → {base_size}x"
+            )
+            g1_result += f"+UNSTABLE(gap={gap:.2f})"
 
-        if not g2_result.startswith("PASS"):
+        size_mult, mod_reasons = _apply_soft_modifiers(
+            base_size, direction, a2_data, sentiment_data, opus_data
+        )
+        g2_result = f"MODIFIER:{','.join(mod_reasons) if mod_reasons else 'ALIGNED'}"
+
+        if mod_reasons:
+            logger.info(
+                f"Aggregator | {pair} soft modifiers: {' | '.join(mod_reasons)} "
+                f"→ {base_size:.2f}x → {size_mult:.2f}x"
+            )
+
+        # ── Gate 4: Entry engine (hard gate) ──────────────────────────────────
+        g4_result = _gate3_entry(entry_data, direction)
+        if g4_result.startswith("FAIL"):
             decision = self._flat_decision(
-                pair, "PASS", g2_result, "SKIP",
-                regime_data, a2_data, opus_data, sentiment_data,
-                conflict_flag, now
+                pair, g1_result, g2_result, g3_ml,
+                regime_data, a2_data, opus_data, sentiment_data, "TECH_BLOCK", now,
+                hmm_regime=hmm_regime, gate1b=g1b_result,
+                gate4=g4_result,
+                entry_score=entry_data.get("entry_score", 0.0),
+                entry_type=entry_data.get("entry_type", ""),
             )
             self._cache(pair, decision)
             return decision
 
-        # ── Gate 3: Technical ML (TCN + PatchTSMixer) ────────
-        # MR_DEFER: A2 was neutral — A4 supplies direction
-        if g1_result == "PASS:MR_DEFER" and direction == "FLAT":
-            a4_dir = tech_data.get("direction", "FLAT")
-            if a4_dir == "LONG":
-                direction = "LONG_BASE"
-            elif a4_dir == "SHORT":
-                direction = "SHORT_BASE"
-            else:
-                decision = self._flat_decision(
-                    pair, g1_result, "PASS", "FAIL:MR_A4_FLAT",
-                    regime_data, a2_data, opus_data, sentiment_data,
-                    "MR_NO_DIRECTION", now
-                )
-                self._cache(pair, decision)
-                return decision
-
-        g3_ml = _gate3_technical(tech_data, direction)
-
-        if g3_ml.startswith("FAIL"):
-            decision = self._flat_decision(
-                pair, "PASS", "PASS", g3_ml,
-                regime_data, a2_data, opus_data, sentiment_data,
-                "A4_BLOCK", now
-            )
-            self._cache(pair, decision)
-            return decision
-        # ── Gate 4: Entry timing (rule-based) ─────────────────
-        g3_result = _gate3_entry(entry_data, direction)
-
-        if g3_result.startswith("FAIL"):
-            decision = self._flat_decision(
-                pair, "PASS", "PASS", g3_result,
-                regime_data, a2_data, opus_data, sentiment_data,
-                "TECH_BLOCK", now
-            )
-            self._cache(pair, decision)
-            return decision
-
-        # ── All gates passed — compute final decision ─────────
-        confidence = _compute_confidence(
-            a2_data, opus_data, sentiment_data,
-            regime_data, conflict_flag,
-            tech_data=tech_data,
+        # ── Confidence ────────────────────────────────────────────────────────
+        confidence = _compute_confidence_v2(
+            a4_conf, a1_regime_conf, hmm_conf, hmm_upgraded,
+            direction, a2_data, sentiment_data, opus_data,
         )
         confidence = round(confidence * PAIR_MODEL_QUALITY.get(pair, 1.0), 4)
 
-        # Convert direction to action
-        action = "LONG" if direction == "LONG_BASE" else "SHORT"
+        # ── APEX penalty ──────────────────────────────────────────────────────
+        apex_ctx = {
+            "a2_fund_score": a2_data.get("score", 0.0),
+            "a1_confidence": a1_regime_conf,
+            "a1_regime":     a1_regime_raw,
+            "a5_sentiment":  sentiment_data.get("sentiment", 0.0),
+            "direction":     "LONG" if direction == "LONG_BASE" else "SHORT",
+        }
+        try:
+            apex_mult, apex_reasons = apex_framework.get_penalty(pair, apex_ctx)
+            if apex_mult < 1.0:
+                confidence = round(confidence * apex_mult, 4)
+                logger.debug(
+                    f"Aggregator | {pair} APEX penalty {apex_mult:.4f}: {apex_reasons}"
+                )
+        except Exception:
+            apex_mult, apex_reasons = 1.0, []
+
+        action  = "LONG" if direction == "LONG_BASE" else "SHORT"
+        mod_str = " | ".join(mod_reasons) if mod_reasons else "ALL_ALIGNED"
 
         decision = {
-            "pair":       pair,
-            "action":     action,
-            "direction":  direction,
-            "confidence": confidence,
-            "size_mult":  size_mult,
-            "gate1":      g1_result,
-            "gate2":      g2_result,
-            "gate3":      g3_ml,
-            "gate4":      g3_result,
-	    "entry_score": round(entry_data.get("entry_score", 0.0), 4),
-            "entry_type":  entry_data.get("entry_type", "WAIT"),
-            "entry_reason": entry_data.get("reason", ""),
-            "regime":     regime,
-            "a2_score":   round(a2_data.get("score", 0.0), 4),
-            "a2_bias":    a2_data.get("bias", "NEUTRAL"),
-            "a2_conf":    round(a2_data.get("confidence", 0.0), 4),
-            "opus_bias":  opus_data.get("bias", "NEUTRAL"),
-            "opus_conv":  round(opus_data.get("conviction", 0.0), 4),
-            "sent_bias":  sentiment_data.get("bias", "NEUTRAL"),
-            "sent_score": round(sentiment_data.get("sentiment", 0.0), 4),
-            "tcn_prob":   round((tech_data or {}).get("tcn_prob",   0.5), 4),
-            "patch_prob": round((tech_data or {}).get("patch_prob", 0.5), 4),
-            "a4_conf":    round((tech_data or {}).get("confidence", 0.0), 4),
-            "conflict":   conflict_flag,
-            "reason":     f"All gates passed | {direction} | regime={regime}",
-            "updated_at": now,
+            "pair":          pair,
+            "action":        action,
+            "direction":     direction,
+            "confidence":    confidence,
+            "size_mult":     size_mult,
+            "gate1":         g1_result,
+            "gate1b":        g1b_result,
+            "gate2":         g2_result,
+            "gate3":         g3_ml,
+            "gate4":         g4_result,
+            "entry_score":   round(entry_data.get("entry_score", 0.0), 4),
+            "entry_type":    entry_data.get("entry_type", "WAIT"),
+            "entry_reason":  entry_data.get("reason", ""),
+            "regime":        effective_regime,
+            "hmm_regime":    hmm_regime,
+            "hmm_conf":      hmm_conf,
+            "a2_score":      round(a2_data.get("score", 0.0), 4),
+            "a2_bias":       a2_data.get("bias", "NEUTRAL"),
+            "a2_conf":       round(a2_data.get("confidence", 0.0), 4),
+            "opus_bias":     opus_data.get("bias", "NEUTRAL"),
+            "opus_conv":     round(opus_data.get("conviction", 0.0), 4),
+            "sent_bias":     sentiment_data.get("bias", "NEUTRAL"),
+            "sent_score":    round(sentiment_data.get("sentiment", 0.0), 4),
+            "tcn_prob":      round(tcn_prob, 4),
+            "patch_prob":    round(patch_prob, 4),
+            "a4_conf":       round(a4_conf, 4),
+            "size_modifiers": mod_reasons,
+            "conflict":      "",
+            "apex_mult":     apex_mult,
+            "apex_reasons":  apex_reasons,
+            "reason":        f"PASS | {action} | regime={effective_regime} | {mod_str}",
+            "updated_at":    now,
         }
 
         self._cache(pair, decision)
         return decision
+
+    # ── Path B: Technical Confluence ──────────────────────────────────────────
+
+    def _technical_confluence_path(self, pair: str) -> Optional[Dict]:
+        """
+        Path B — Technical Confluence entry.
+
+        Fires when D1 trend + H1 trend + A4 TCN + A4 PatchTSMixer all agree
+        on the same direction, even if fundamentals (A1/A2) did not confirm.
+
+        Requirements:
+          - D1 EMA20 trend clearly BULL or BEAR (d1_trend_dir ≠ 0)
+          - H1 EMA20 trend same direction (h1_trend_dir matches d1_trend_dir)
+          - A4 TCN direction matches trend
+          - A4 PatchTSMixer direction matches trend
+          - Entry engine score ≥ 0.40 (relaxed from fundamental path 0.65)
+          - All risk gates still apply (cooldown, session cap, correlation)
+
+        Returns decision dict with path="TECH_CONFLUENCE", size_mult=0.75,
+        or None if conditions not met.
+        """
+        try:
+            # ── Load stat features (D1/H1 trend) ─────────────────────────────
+            stat_raw = self.r.get(f"features:stat:{pair}")
+            if not stat_raw:
+                return None
+            stat_data = json.loads(stat_raw)
+
+            d1_trend = int(stat_data.get("d1_trend_dir", 0))
+            h1_trend = int(stat_data.get("h1_trend_dir", 0))
+            d1_slope = float(stat_data.get("d1_ema20_slope", 0.0))
+            h1_slope = float(stat_data.get("h1_ema20_slope", 0.0))
+
+            # Both timeframes must agree and be non-flat
+            if d1_trend == 0 or h1_trend == 0:
+                return None
+            if d1_trend != h1_trend:
+                return None
+
+            tc_direction = "LONG_BASE" if d1_trend == 1 else "SHORT_BASE"
+            action       = "LONG"     if d1_trend == 1 else "SHORT"
+
+            # ── A4 must confirm same direction ────────────────────────────────
+            tech_data = _read_technical(self.r, pair)
+            if not tech_data:
+                return None
+
+            a4_dir  = tech_data.get("direction", "FLAT")
+            a4_gate = tech_data.get("gate", "FAIL")
+            tcn_prob   = float(tech_data.get("tcn_prob",   0.5))
+            patch_prob = float(tech_data.get("patch_prob", 0.5))
+
+            if a4_gate != "PASS":
+                return None
+            if a4_dir != action:
+                return None
+
+            # Both A4 model probabilities must lean toward direction (>0.52)
+            if action == "LONG"  and (tcn_prob < 0.52 or patch_prob < 0.52):
+                return None
+            if action == "SHORT" and (tcn_prob > 0.48 or patch_prob > 0.48):
+                return None
+
+            # ── Entry engine: relaxed threshold (0.40 vs 0.65) ───────────────
+            entry_data = _read_entry(self.r, pair)
+            entry_score = float(entry_data.get("entry_score", 0.0))
+            entry_type  = entry_data.get("entry_type", "WAIT")
+
+            if entry_score < 0.40:
+                logger.debug(
+                    f"Aggregator | {pair} TC: entry_score {entry_score:.2f} < 0.40, skip"
+                )
+                return None
+
+            # BLOCKED_SR is a hard stop even on Path B (entering into a wall is bad)
+            if entry_type == "BLOCKED_SR":
+                return None
+
+            # ── Compute confluence confidence ─────────────────────────────────
+            # Base 0.62, boosted by slope strength and A4 probability alignment
+            slope_boost = min(0.05, abs(d1_slope) * 0.01 + abs(h1_slope) * 0.02)
+            a4_boost    = (abs(tcn_prob - 0.5) + abs(patch_prob - 0.5)) * 0.1
+            confidence  = round(min(0.80, 0.62 + slope_boost + a4_boost), 4)
+
+            # APEX penalty applies to Path B too
+            try:
+                regime_data  = _read_regime(self.r, pair)
+                regime_b     = regime_data.get("regime", "MR")
+
+                # HMM tag — observability only on bypass paths (no gate)
+                hmm_raw_b    = _read_regime_hmm(self.r, pair)
+                hmm_regime_b = (hmm_raw_b or {}).get("regime", "")
+                hmm_conf_b   = round((hmm_raw_b or {}).get("confidence", 0.0), 4)
+                g1b_b        = _hmm_regime_tag(hmm_regime_b, regime_b, False)
+
+                apex_ctx = {
+                    "a2_fund_score": 0.0,   # no fundamental score in Path B
+                    "a1_confidence": regime_data.get("confidence", 0.0),
+                    "a1_regime":     regime_b,
+                    "a5_sentiment":  0.0,
+                    "direction":     "LONG" if tc_direction == "LONG_BASE" else "SHORT",
+                }
+                apex_mult, apex_reasons = apex_framework.get_penalty(pair, apex_ctx)
+                if apex_mult < 1.0:
+                    confidence = round(confidence * apex_mult, 4)
+            except Exception:
+                apex_mult    = 1.0
+                apex_reasons = []
+                regime_b     = "?"
+                hmm_regime_b = ""
+                hmm_conf_b   = 0.0
+                g1b_b        = "SKIP"   # HMM tag on error
+
+            now = datetime.now(timezone.utc).isoformat()
+            regime = (json.loads(self.r.get(f"features:regime:{pair}") or "{}") or {}).get("regime", "?")
+
+            logger.info(
+                f"Aggregator | {pair} PATH-B CONFLUENCE: {action} "
+                f"D1={d1_slope:+.3f}% H1={h1_slope:+.3f}% "
+                f"A4={a4_dir} tcn={tcn_prob:.2f} patch={patch_prob:.2f} "
+                f"entry={entry_score:.2f} conf={confidence:.2f}"
+            )
+
+            return {
+                "pair":         pair,
+                "action":       action,
+                "direction":    tc_direction,
+                "confidence":   confidence,
+                "size_mult":    0.75,
+                "gate1":        f"BYPASS:D1_TREND({d1_slope:+.3f}%)",
+                "gate2":        f"BYPASS:H1_TREND({h1_slope:+.3f}%)",
+                "gate3":        f"PASS:A4({a4_dir},tcn={tcn_prob:.2f},patch={patch_prob:.2f})",
+                "gate4":        f"PASS:ENTRY({entry_score:.2f})",
+                "entry_score":  round(entry_score, 4),
+                "entry_type":   entry_type,
+                "entry_reason": entry_data.get("reason", ""),
+                "regime":       regime,
+                "hmm_regime":   hmm_regime_b,
+                "hmm_conf":     hmm_conf_b,
+                "gate1b":       g1b_b,
+                "a2_score":     0.0,
+                "a2_bias":      "NEUTRAL",
+                "a2_conf":      0.0,
+                "opus_bias":    "NEUTRAL",
+                "opus_conv":    0.0,
+                "sent_bias":    "NEUTRAL",
+                "sent_score":   0.0,
+                "tcn_prob":     round(tcn_prob,   4),
+                "patch_prob":   round(patch_prob, 4),
+                "a4_conf":      round(tech_data.get("confidence", 0.0), 4),
+                "conflict":     "",
+                "apex_mult":    apex_mult,
+                "apex_reasons": apex_reasons,
+                "path":         "TECH_CONFLUENCE",
+                "reason": (
+                    f"PATH-B | D1={d1_slope:+.3f}% H1={h1_slope:+.3f}% "
+                    f"A4={a4_dir} entry={entry_score:.2f}"
+                ),
+                "updated_at":   now,
+            }
+
+        except Exception as exc:
+            logger.warning(f"Aggregator | {pair} TC path failed: {exc}")
+            return None
 
     def evaluate_all(self) -> Dict[str, Dict]:
         """Evaluate all 12 pairs and return full decision dict."""
@@ -1056,28 +1891,38 @@ class SignalAggregator:
         sentiment_data: Dict,
         conflict: str,
         now: str,
+        hmm_regime: str = "",
+        gate1b: str = "SKIP",
+        gate4: str = "",
+        entry_score: float = 0.0,
+        entry_type: str = "",
     ) -> Dict:
         """Build a FLAT decision dict."""
         return {
-            "pair":       pair,
-            "action":     "FLAT",
-            "direction":  "FLAT",
-            "confidence": 0.0,
-            "size_mult":  0.0,
-            "gate1":      g1,
-            "gate2":      g2,
-            "gate3":      g3,
-            "regime":     regime_data.get("regime", "?"),
-            "a2_score":   round(a2_data.get("score", 0.0), 4),
-            "a2_bias":    a2_data.get("bias", "NEUTRAL"),
-            "a2_conf":    round(a2_data.get("confidence", 0.0), 4),
-            "opus_bias":  opus_data.get("bias", "NEUTRAL"),
-            "opus_conv":  round(opus_data.get("conviction", 0.0), 4),
-            "sent_bias":  sentiment_data.get("bias", "NEUTRAL"),
-            "sent_score": round(sentiment_data.get("sentiment", 0.0), 4),
-            "conflict":   conflict,
-            "reason":     f"FLAT | g1={g1} g2={g2} g3={g3}",
-            "updated_at": now,
+            "pair":        pair,
+            "action":      "FLAT",
+            "direction":   "FLAT",
+            "confidence":  0.0,
+            "size_mult":   0.0,
+            "gate1":       g1,
+            "gate1b":      gate1b,
+            "gate2":       g2,
+            "gate3":       g3,
+            "gate4":       gate4,
+            "entry_score": round(entry_score, 4),
+            "entry_type":  entry_type,
+            "regime":      regime_data.get("regime", "?"),
+            "hmm_regime":  hmm_regime,
+            "a2_score":    round(a2_data.get("score", 0.0), 4),
+            "a2_bias":     a2_data.get("bias", "NEUTRAL"),
+            "a2_conf":     round(a2_data.get("confidence", 0.0), 4),
+            "opus_bias":   opus_data.get("bias", "NEUTRAL"),
+            "opus_conv":   round(opus_data.get("conviction", 0.0), 4),
+            "sent_bias":   sentiment_data.get("bias", "NEUTRAL"),
+            "sent_score":  round(sentiment_data.get("sentiment", 0.0), 4),
+            "conflict":    conflict,
+            "reason":      f"FLAT | g1={g1} g1b={gate1b} g2={g2} g3={g3}" + (f" g4={gate4}" if gate4 else ""),
+            "updated_at":  now,
         }
 
     @staticmethod

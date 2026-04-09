@@ -627,6 +627,19 @@ class TechnicalExitMonitor:
                 """))
                 rows = result.fetchall()
 
+            # Filter out hedge legs — hedge_manager owns those positions
+            try:
+                import redis as _redis_lib
+                _r = _redis_lib.Redis(
+                    host=os.getenv("REDIS_HOST", "localhost"),
+                    port=int(os.getenv("REDIS_PORT", "6379")),
+                    password=os.getenv("REDIS_PASSWORD") or None,
+                    decode_responses=True,
+                )
+                rows = [row for row in rows if not _r.get(f"hedge:active:{row[1]}")]
+            except Exception:
+                pass  # if Redis fails, proceed with all rows
+
             for row in rows:
                 pos_id, symbol, direction, entry, sl, entry_time, ctrader_id = row
 

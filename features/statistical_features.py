@@ -16,7 +16,7 @@ Design rationale:
   - ADR in pips is the course-specified non-normal vol measure for forex
   - BB %B combines mean + vol in one [0,1] normalised position
 
-Features produced per pair (17 total):
+Features produced per pair (22 total):
   atr_14              14-period ATR (pips, using D1 bars)
   atr_pct             ATR as % of current price
   atr_ratio           atr_14 / atr_50  — short vs long vol comparison
@@ -34,6 +34,18 @@ Features produced per pair (17 total):
   price_vs_week_high  Close position in 5-day range [0, 1]
   price_vs_month_high Close position in 20-day range [0, 1]
   bb_pct_20           Bollinger Band %B, 20-day window [0, 1]
+
+  — Multi-timeframe trend (new, used by technical confluence path) —
+  d1_trend_dir        D1 EMA20 slope direction: +1 BULL / 0 FLAT / -1 BEAR
+  d1_ema20_slope      D1 EMA20 % change over last 5 days
+  d1_price_vs_ema20   (price − EMA20) / ATR  — normalised distance
+  h1_trend_dir        H1 EMA20 slope direction: +1 BULL / 0 FLAT / -1 BEAR
+  h1_ema20_slope      H1 EMA20 % change over last 24 bars
+
+  — M15 EMA cross (scalp momentum trigger) —
+  m15_ema9            Current M15 EMA(9) value
+  m15_ema21           Current M15 EMA(21) value
+  m15_ema_cross       +1 = fresh bullish cross | -1 = bearish | 0 = no cross
 
 Redis keys:  features:stat:{PAIR}  (e.g. features:stat:EURUSD)
 TTL:         3600 seconds (1 hour — price features need freshness)
@@ -86,6 +98,12 @@ HIGH_VOL_THRESHOLD: float = 1.5  # atr_ratio or vol_ratio > this = high vol
 
 # Lookback in D1 bars needed for longest feature (50-period ATR)
 MIN_BARS_REQUIRED: int = 60
+
+# Multi-timeframe trend thresholds
+D1_SLOPE_BULL: float =  0.10   # EMA20 % change over 5 days > this = BULL
+D1_SLOPE_BEAR: float = -0.10
+H1_SLOPE_BULL: float =  0.05   # EMA20 % change over 24 bars > this = BULL
+H1_SLOPE_BEAR: float = -0.05
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -189,10 +207,16 @@ class StatisticalFeatureEngine:
                     continue
 
                 feats = self._compute_features(df, pair)
+                feats.update(self._compute_h1_trend(pair))
+                feats.update(self._compute_m15_ema_cross(pair))
                 key = f"{REDIS_PREFIX}:{pair}"
                 self._redis_set(key, feats, ttl=REDIS_TTL)
                 results[pair] = feats
-                logger.debug(f"StatEngine | {pair}: {len(feats)} features cached")
+                logger.debug(
+                    f"StatEngine | {pair}: {len(feats)} features | "
+                    f"D1={feats.get('d1_trend_dir'):+.0f}({feats.get('d1_ema20_slope'):.3f}%) "
+                    f"H1={feats.get('h1_trend_dir'):+.0f}({feats.get('h1_ema20_slope'):.3f}%)"
+                )
 
             except Exception as exc:
                 logger.error(f"StatEngine | {pair} failed: {exc}")
@@ -295,6 +319,42 @@ class StatisticalFeatureEngine:
             logger.error(f"StatEngine | DB load failed for {pair}: {exc}")
             return None
 
+    def _load_h1_ohlcv(self, pair: str) -> Optional[pd.DataFrame]:
+        """
+        Load M15 candles and resample to H1 for the last 30 days.
+
+        Used for the H1 trend features (d1_trend_dir, h1_ema20_slope).
+        Resampling from M15 is preferred over reading the H1 table directly
+        because M15 is always live and avoids a separate daily fill dependency.
+        """
+        query = text("""
+            SELECT time, open, high, low, close
+            FROM ohlcv
+            WHERE symbol    = :symbol
+              AND timeframe = 'M15'
+              AND time      >= NOW() - INTERVAL '30 days'
+            ORDER BY time ASC
+        """)
+        try:
+            with db.connection() as conn:
+                rows = conn.execute(query, {"symbol": pair}).fetchall()
+            if not rows:
+                return None
+            df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close"])
+            df["time"] = pd.to_datetime(df["time"], utc=True)
+            df = df.set_index("time").sort_index()
+            df = df.astype({"open": float, "high": float, "low": float, "close": float})
+            if pair in JPY_PAIRS:
+                for col in ["open", "high", "low", "close"]:
+                    df[col] = df[col] / 100.0
+            df_h1 = df.resample("1h").agg(
+                {"open": "first", "high": "max", "low": "min", "close": "last"}
+            ).dropna()
+            return df_h1
+        except Exception as exc:
+            logger.debug(f"StatEngine | H1 load failed {pair}: {exc}")
+            return None
+
     # ── Feature computation ───────────────────────────────────────────────────
 
     def _compute_features(self, df: pd.DataFrame, pair: str) -> Dict[str, float]:
@@ -375,7 +435,108 @@ class StatisticalFeatureEngine:
         # [0,1] is normal range — values outside indicate breakout or extremity
         feats["bb_pct_20"] = round(self._bollinger_pct(close, period=20, std_mult=2.0), 4)
 
+        # ── D1 multi-timeframe trend ───────────────────────────────────────────
+        # EMA20 slope over 5 days: bullish if price has been consistently rising.
+        # Used by technical confluence path to validate entry direction vs D1 bias.
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        if len(ema20) >= 6 and float(ema20.iloc[-6]) > 0:
+            d1_slope = (float(ema20.iloc[-1]) - float(ema20.iloc[-6])) / float(ema20.iloc[-6]) * 100.0
+        else:
+            d1_slope = 0.0
+        d1_trend = 1 if d1_slope > D1_SLOPE_BULL else (-1 if d1_slope < D1_SLOPE_BEAR else 0)
+
+        atr_val = feats.get("atr_14", 0.0)
+        d1_vs_ema = (c_now - float(ema20.iloc[-1])) / atr_val if atr_val > 0 else 0.0
+
+        feats["d1_trend_dir"]      = float(d1_trend)
+        feats["d1_ema20_slope"]    = round(d1_slope, 4)
+        feats["d1_price_vs_ema20"] = round(d1_vs_ema, 4)
+
         return feats
+
+    def _compute_h1_trend(self, pair: str) -> Dict[str, float]:
+        """
+        Compute H1 EMA20 trend direction and slope.
+
+        Returns dict with h1_trend_dir (+1/0/-1) and h1_ema20_slope (%).
+        Falls back to neutral (0.0) if H1 data is unavailable.
+        """
+        df_h1 = self._load_h1_ohlcv(pair)
+        if df_h1 is None or len(df_h1) < 25:
+            return {"h1_trend_dir": 0.0, "h1_ema20_slope": 0.0}
+
+        h1_close = df_h1["close"]
+        h1_ema20 = h1_close.ewm(span=20, adjust=False).mean()
+
+        # Slope over last 24 H1 bars (1 trading day)
+        if len(h1_ema20) >= 25 and float(h1_ema20.iloc[-25]) > 0:
+            h1_slope = (float(h1_ema20.iloc[-1]) - float(h1_ema20.iloc[-25])) / float(h1_ema20.iloc[-25]) * 100.0
+        else:
+            h1_slope = 0.0
+
+        h1_trend = 1 if h1_slope > H1_SLOPE_BULL else (-1 if h1_slope < H1_SLOPE_BEAR else 0)
+        return {
+            "h1_trend_dir":   float(h1_trend),
+            "h1_ema20_slope": round(h1_slope, 4),
+        }
+
+    def _compute_m15_ema_cross(self, pair: str) -> Dict[str, float]:
+        """
+        Compute M15 EMA(9) and EMA(21) and detect a fresh crossover.
+
+        A crossover is "fresh" when the EMA9/EMA21 relationship flipped
+        in the last 2 bars — i.e. a signal fired this bar or the previous bar.
+        Stale crosses (more than 2 bars ago) return 0 to avoid chasing.
+
+        Returns:
+            m15_ema9      Current M15 EMA(9) value
+            m15_ema21     Current M15 EMA(21) value
+            m15_ema_cross +1 = bullish cross (EMA9 crossed above EMA21)
+                          -1 = bearish cross
+                           0 = no recent cross / ema9 below ema21 (no cross)
+        """
+        try:
+            query = text("""
+                SELECT time, close
+                FROM ohlcv
+                WHERE symbol    = :symbol
+                  AND timeframe = 'M15'
+                  AND time      >= NOW() - INTERVAL '3 days'
+                ORDER BY time ASC
+            """)
+            with db.connection() as conn:
+                rows = conn.execute(query, {"symbol": pair}).fetchall()
+
+            if len(rows) < 25:
+                return {"m15_ema9": 0.0, "m15_ema21": 0.0, "m15_ema_cross": 0.0}
+
+            df = pd.DataFrame(rows, columns=["time", "close"])
+            df["close"] = df["close"].astype(float)
+            if pair in JPY_PAIRS:
+                df["close"] = df["close"] / 100.0
+
+            ema9  = df["close"].ewm(span=9,  adjust=False).mean()
+            ema21 = df["close"].ewm(span=21, adjust=False).mean()
+
+            # Detect fresh cross in last 2 bars (current + 1 bar back)
+            cross = 0.0
+            if len(ema9) >= 3:
+                prev_above = float(ema9.iloc[-3]) > float(ema21.iloc[-3])
+                curr_above = float(ema9.iloc[-1]) > float(ema21.iloc[-1])
+                if not prev_above and curr_above:
+                    cross = 1.0    # bullish: EMA9 just crossed above EMA21
+                elif prev_above and not curr_above:
+                    cross = -1.0   # bearish: EMA9 just crossed below EMA21
+
+            return {
+                "m15_ema9":      round(float(ema9.iloc[-1]),  6),
+                "m15_ema21":     round(float(ema21.iloc[-1]), 6),
+                "m15_ema_cross": cross,
+            }
+
+        except Exception as exc:
+            logger.debug(f"StatEngine | M15 EMA cross failed {pair}: {exc}")
+            return {"m15_ema9": 0.0, "m15_ema21": 0.0, "m15_ema_cross": 0.0}
 
     # ── Mathematical helpers ──────────────────────────────────────────────────
 

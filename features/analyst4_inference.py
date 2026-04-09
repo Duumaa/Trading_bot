@@ -96,9 +96,10 @@ REGIME_THRESHOLDS: Dict[str, Dict[str, float]] = {
 }
 
 # Confidence boost/dampener based on agreement strength
-AGREE_BOOST   = 1.10   # both models strongly agree
-AGREE_NEUTRAL = 1.00   # both agree at threshold
-DISAGREE_DAMP = 0.90   # models disagree (shouldn't reach gate but just in case)
+AGREE_BOOST    = 1.10   # both models strongly agree
+AGREE_NEUTRAL  = 1.00   # both agree at threshold
+DISAGREE_DAMP  = 0.90   # models disagree (shouldn't reach gate but just in case)
+SINGLE_PENALTY = 0.85   # only one model fires — OR logic, reduced conviction
 
 
 class Analyst4Inference:
@@ -311,11 +312,19 @@ class Analyst4Inference:
             t_tcn   = thresholds['tcn']
             t_patch = thresholds['patch']
 
-            # Co-gate logic — both must agree
-            long_signal  = (tcn_prob > t_tcn) and (patch_prob > t_patch)
-            short_signal = (tcn_prob < (1 - t_tcn)) and (patch_prob < (1 - t_patch))
+            # Per-model direction flags
+            tcn_long    = tcn_prob   > t_tcn
+            tcn_short   = tcn_prob   < (1 - t_tcn)
+            patch_long  = patch_prob > t_patch
+            patch_short = patch_prob < (1 - t_patch)
 
-            if long_signal:
+            both_long  = tcn_long  and patch_long
+            both_short = tcn_short and patch_short
+
+            # Conflict: models point opposite directions — always block
+            conflict = (tcn_long and patch_short) or (tcn_short and patch_long)
+
+            if both_long:
                 direction = 'LONG'
                 agreed    = True
                 # Confidence = geometric mean of how far above threshold each model is
@@ -325,7 +334,7 @@ class Analyst4Inference:
                 confidence     = min(round(raw_conf * AGREE_BOOST, 4), 1.0)
                 gate           = 'PASS'
 
-            elif short_signal:
+            elif both_short:
                 direction = 'SHORT'
                 agreed    = True
                 tcn_strength   = ((1 - t_tcn)   - tcn_prob)   / (1 - t_tcn)
@@ -333,6 +342,28 @@ class Analyst4Inference:
                 raw_conf       = float(np.sqrt(tcn_strength * patch_strength))
                 confidence     = min(round(raw_conf * AGREE_BOOST, 4), 1.0)
                 gate           = 'PASS'
+
+            elif not conflict and (tcn_long or patch_long):
+                # Only one model fires LONG, other is neutral (not actively short)
+                direction = 'LONG'
+                agreed    = False
+                if tcn_long:
+                    strength = (tcn_prob - t_tcn) / (1.0 - t_tcn)
+                else:
+                    strength = (patch_prob - t_patch) / (1.0 - t_patch)
+                confidence = min(round(strength * SINGLE_PENALTY, 4), 1.0)
+                gate       = 'PASS_SINGLE'
+
+            elif not conflict and (tcn_short or patch_short):
+                # Only one model fires SHORT, other is neutral
+                direction = 'SHORT'
+                agreed    = False
+                if tcn_short:
+                    strength = ((1 - t_tcn) - tcn_prob) / (1 - t_tcn)
+                else:
+                    strength = ((1 - t_patch) - patch_prob) / (1 - t_patch)
+                confidence = min(round(strength * SINGLE_PENALTY, 4), 1.0)
+                gate       = 'PASS_SINGLE'
 
             else:
                 direction  = 'FLAT'
@@ -430,10 +461,12 @@ class Analyst4Inference:
             result = self.compute_pair(pair)
             if result:
                 results[pair] = result
-                if result.get('gate') == 'PASS':
+                gate = result.get('gate', 'FAIL')
+                if gate in ('PASS', 'PASS_SINGLE'):
                     passes += 1
+                    single_tag = " (single)" if gate == 'PASS_SINGLE' else ""
                     logger.info(
-                        f"Analyst4 | {pair}: {result['direction']} "
+                        f"Analyst4 | {pair}: {result['direction']}{single_tag} "
                         f"conf={result['confidence']:.3f} "
                         f"tcn={result['tcn_prob']:.3f} "
                         f"patch={result['patch_prob']:.3f} "
@@ -524,5 +557,5 @@ if __name__ == '__main__':
             tcn   = d.get('tcn_prob', 0)
             patch = d.get('patch_prob', 0)
             reg   = d.get('regime', '?')
-            icon  = '✅' if gate == 'PASS' else '❌'
+            icon  = '✅' if gate == 'PASS' else ('⚡' if gate == 'PASS_SINGLE' else '❌')
             print(f"{icon} {pair:<8} {gate:<8} {dirn:<8} {conf:>6.3f} {tcn:>6.3f} {patch:>7.3f} {reg}")

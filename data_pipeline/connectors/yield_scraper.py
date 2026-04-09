@@ -66,6 +66,10 @@ FRED_SERIES: List[Tuple[str, str, str]] = [
     ("USD", "2Y",  "DGS2"),
     ("USD", "10Y", "DGS10"),
     ("USD", "3M",  "DGS3MO"),
+    # USD TIPS — real yields directly (no CPI adjustment needed)
+    # FRED has no 2Y TIPS; DFII5 (5Y) is shortest available
+    ("USD", "REAL_5Y",  "DFII5"),
+    ("USD", "REAL_10Y", "DFII10"),
     # Secondary G10 monthly OECD (EUR/GBP/JPY overridden by CB sources below)
     ("EUR", "10Y", "IRLTLT01DEM156N"),
     ("GBP", "10Y", "IRLTLT01GBM156N"),
@@ -76,6 +80,20 @@ FRED_SERIES: List[Tuple[str, str, str]] = [
     ("NZD", "10Y", "IRLTLT01NZM156N"),
     ("SEK", "10Y", "IRLTLT01SEM156N"),
     ("NOK", "10Y", "IRLTLT01NOM156N"),
+]
+
+# ── CPI / inflation series for real rate computation ───────────────────────────
+# Monthly index levels (2015=100) — YoY% computed on fetch.
+# USD uses TIPS directly so no CPI series needed.
+FRED_CPI_SERIES: List[Tuple[str, str]] = [
+    ("EUR", "CP0000EZ19M086NEST"),   # EA HICP monthly index
+    ("GBP", "GBRCPIALLMINMEI"),      # UK CPI monthly
+    ("JPY", "JPNCPIALLMINMEI"),      # Japan CPI monthly
+    ("CHF", "CHECPIALLMINMEI"),      # Switzerland CPI monthly
+    ("CAD", "CANCPIALLMINMEI"),      # Canada CPI monthly
+    ("SEK", "SWECPIALLMINMEI"),      # Sweden CPI monthly
+    ("NOK", "NORCPIALLMINMEI"),      # Norway CPI monthly
+    # AUD/NZD quarterly series not available on FRED — skipped
 ]
 
 # ── ECB config ─────────────────────────────────────────────────────────────────
@@ -323,6 +341,50 @@ class YieldScraper:
             return {}
 
     # =========================================================================
+    # CPI / inflation series
+    # =========================================================================
+
+    def _fetch_cpi_series(self, lookback_years: int = 5) -> Dict[str, pd.Series]:
+        """
+        Fetch G10 CPI index levels from FRED, compute YoY% inflation rate.
+        Returns dict keyed {CCY}_CPI with annualised YoY inflation %.
+        USD excluded — real yields fetched directly via TIPS (DFII2/DFII10).
+        """
+        # Always use 6-year lookback — monthly CPI needs 13+ months after shift(12)
+        cpi_start = (datetime.now(UTC) - timedelta(days=6 * 365)).strftime("%Y-%m-%d")
+        end       = datetime.now(UTC).strftime("%Y-%m-%d")
+        result: Dict[str, pd.Series] = {}
+
+        for ccy, sid in FRED_CPI_SERIES:
+            raw = self._fetch_fred(sid, cpi_start, end)
+            if raw.empty:
+                logger.warning(f"CPI | {ccy} ({sid}): no data")
+                continue
+            try:
+                # YoY% = (index_now / index_12m_ago - 1) * 100
+                # Monthly series: resample to month-end then shift 12 months
+                monthly = raw.resample("ME").last().dropna()
+                if len(monthly) < 14:
+                    logger.warning(f"CPI | {ccy}: insufficient history ({len(monthly)} months)")
+                    continue
+                yoy = ((monthly / monthly.shift(12)) - 1.0) * 100.0
+                yoy = yoy.dropna()
+                # Forward-fill to daily granularity to align with yield_data
+                daily = yoy.reindex(
+                    pd.date_range(yoy.index[0], end, freq="D")
+                ).ffill()
+                result[f"{ccy}_CPI"] = daily
+                logger.debug(
+                    f"CPI | {ccy}: {len(daily)} daily obs, "
+                    f"latest={round(float(daily.iloc[-1]), 2)}%"
+                )
+            except Exception as exc:
+                logger.warning(f"CPI | {ccy} compute failed: {exc}")
+            time.sleep(0.2)
+
+        return result
+
+    # =========================================================================
     # Orchestrated fetch
     # =========================================================================
 
@@ -330,13 +392,14 @@ class YieldScraper:
         """
         Fetch all G10 yields using best source per currency.
         Central bank APIs override FRED monthly series where available.
+        Also fetches CPI for real rate computation.
         """
         start = (datetime.now(UTC) - timedelta(days=lookback_years * 365)).strftime("%Y-%m-%d")
         end   = datetime.now(UTC).strftime("%Y-%m-%d")
         results: Dict[str, pd.Series] = {}
 
-        # 1. FRED — USD daily + secondary monthly
-        logger.info("Yields | [1/4] FRED...")
+        # 1. FRED — USD daily + secondary monthly + USD TIPS real yields
+        logger.info("Yields | [1/5] FRED (nominal + TIPS)...")
         for ccy, tenor, sid in FRED_SERIES:
             s = self._fetch_fred(sid, start, end)
             if not s.empty:
@@ -344,7 +407,7 @@ class YieldScraper:
             time.sleep(0.2)
 
         # 2. ECB — EUR daily (overrides FRED monthly)
-        logger.info("Yields | [2/4] ECB (EUR same-day)...")
+        logger.info("Yields | [2/5] ECB (EUR same-day)...")
         for key, series_key in ECB_SERIES.items():
             s = self._fetch_ecb(key, series_key, start)
             if not s.empty:
@@ -355,7 +418,7 @@ class YieldScraper:
             time.sleep(0.3)
 
         # 3. BoE — GBP daily (overrides FRED monthly)
-        logger.info("Yields | [3/4] BoE (GBP same-day)...")
+        logger.info("Yields | [3/5] BoE (GBP same-day)...")
         for key, sid in BOE_SERIES.items():
             s = self._fetch_boe(key, sid, start)
             if not s.empty:
@@ -366,11 +429,17 @@ class YieldScraper:
             time.sleep(0.3)
 
         # 4. BoJ — JPY daily (overrides FRED monthly)
-        logger.info("Yields | [4/4] BoJ/MoF (JPY same-day)...")
+        logger.info("Yields | [4/5] BoJ/MoF (JPY same-day)...")
         for key, s in self._fetch_boj(start).items():
             if not s.empty:
                 results[key] = s
                 logger.info(f"  BoJ {key}: {len(s)} obs ✅")
+
+        # 5. CPI — G10 inflation for real rate computation
+        logger.info("Yields | [5/5] FRED CPI (real rate base)...")
+        cpi_series = self._fetch_cpi_series(lookback_years)
+        results.update(cpi_series)
+        logger.info(f"  CPI: {len(cpi_series)} currencies ✅")
 
         return results
 
@@ -410,7 +479,12 @@ class YieldScraper:
         return summary
 
     def _build_rows(self, series_map: Dict[str, pd.Series]) -> List[Dict[str, Any]]:
-        """Build flat DB rows + compute SLOPE where 2Y+10Y both exist."""
+        """
+        Build flat DB rows + compute derived series:
+          SLOPE     = 10Y - 2Y  (yield curve)
+          REAL_10Y  = 10Y - CPI (non-USD only; USD uses TIPS directly)
+          REAL_2Y   = 2Y  - CPI (non-USD, where 2Y data exists)
+        """
         rows: List[Dict[str, Any]] = []
 
         for key, series in series_map.items():
@@ -425,10 +499,13 @@ class YieldScraper:
                     "yield_pct": float(value),
                 })
 
-        # Compute slopes for currencies with both 2Y and 10Y
-        for ccy in set(k.split("_")[0] for k in series_map):
+        all_ccys = set(k.split("_")[0] for k in series_map)
+
+        for ccy in all_ccys:
             s10 = series_map.get(f"{ccy}_10Y")
             s2  = series_map.get(f"{ccy}_2Y")
+
+            # SLOPE: 10Y - 2Y
             if s10 is not None and s2 is not None:
                 common = s10.index.intersection(s2.index)
                 slope  = s10.loc[common] - s2.loc[common]
@@ -442,6 +519,43 @@ class YieldScraper:
                         "yield_pct": float(value),
                     })
                 logger.debug(f"Slope {ccy}: {len(slope)} rows")
+
+            # REAL_10Y / REAL_2Y for non-USD: nominal - CPI inflation
+            # USD already has TIPS real yields stored directly (DFII5/DFII10)
+            if ccy == "USD":
+                continue
+
+            cpi = series_map.get(f"{ccy}_CPI")
+            if cpi is None:
+                continue
+
+            if s10 is not None:
+                common10 = s10.index.intersection(cpi.index)
+                real10   = s10.loc[common10] - cpi.loc[common10]
+                for date, value in real10.items():
+                    if pd.isna(value):
+                        continue
+                    rows.append({
+                        "date":      date.strftime("%Y-%m-%d"),
+                        "currency":  ccy,
+                        "tenor":     "REAL_10Y",
+                        "yield_pct": float(value),
+                    })
+                logger.debug(f"Real10Y {ccy}: {len(real10)} rows")
+
+            if s2 is not None:
+                common2 = s2.index.intersection(cpi.index)
+                real2   = s2.loc[common2] - cpi.loc[common2]
+                for date, value in real2.items():
+                    if pd.isna(value):
+                        continue
+                    rows.append({
+                        "date":      date.strftime("%Y-%m-%d"),
+                        "currency":  ccy,
+                        "tenor":     "REAL_2Y",
+                        "yield_pct": float(value),
+                    })
+                logger.debug(f"Real2Y {ccy}: {len(real2)} rows")
 
         return rows
 

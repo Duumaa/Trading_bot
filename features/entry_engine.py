@@ -42,6 +42,9 @@ Entry types produced:
   OBI_CONFIRM      Order book imbalance strongly confirming direction
   MOMENTUM_ENTRY   Clean momentum continuation, no pullback needed
   SPREAD_ENTRY     Spread normalised after spike — safe window
+  EMA_CROSS        M15 EMA(9) crossed EMA(21) — fresh momentum signal
+  SESSION_BREAKOUT London or NY open break of prior session range
+  SR_FADE_MR       MR regime: direction flipped to fade structural S/R level
   WAIT             Good direction but no clean entry yet
 
 Redis reads:
@@ -96,9 +99,23 @@ REDIS_PREFIX       = "features:entry"
 SCHEDULER_INTERVAL = 900   # recompute every M15 bar
 
 # Entry score thresholds
-SCORE_EXECUTE  = 0.65   # fire immediately
-SCORE_WAIT     = 0.40   # good setup, wait 1 more bar
-SCORE_SKIP     = 0.40   # below this → skip entirely
+SCORE_EXECUTE     = 0.65   # fire immediately (MR + TLV)
+SCORE_EXECUTE_THV = 0.55   # THV — trend already confirmed, lower bar acceptable
+SCORE_WAIT        = 0.40   # good setup, wait 1 more bar
+SCORE_SKIP        = 0.40   # below this → skip entirely
+
+# Session breakout windows (UTC hours) — London and NY open
+LONDON_OPEN_START = 8
+LONDON_OPEN_END   = 9    # 08:00–08:59 UTC
+NY_OPEN_START     = 13
+NY_OPEN_END       = 14   # 13:00–13:59 UTC
+SESSION_BREAKOUT_MIN_PIPS = 1.0   # minimum pip break to confirm (not a false break)
+
+# Chase detection — entry_position_in_bar: how far into the triggering M15 bar
+# the entry price is in the signal direction (1.0 = entered at bar extreme = full chase)
+CHASE_PENALTY_SOFT = 0.70   # position 0.70–0.85 → score × 0.70
+CHASE_PENALTY_HARD = 0.85   # position > 0.85    → score × 0.40
+JPY_PAIRS = {"USDJPY", "EURJPY", "GBPJPY", "AUDJPY", "NZDJPY"}
 
 # RSI thresholds
 RSI_OVERBOUGHT = 65.0
@@ -242,35 +259,28 @@ class EntryEngine:
         a2_bias   = a2_data.get("bias", "NEUTRAL")
         a2_conf   = a2_data.get("confidence", 0.0)
 
-        # Derive direction from A2 bias
-        # MR regime: A2 neutral is expected — use A4 TCN/PatchTSMixer direction
+        # Derive direction from A2 bias.
+        # When A2 is neutral, always fall back to A4 (TCN/PatchTSMixer).
+        # A4 is now the primary direction source in the 2-gate architecture.
         if a2_bias == "LONG_BASE":
             direction = "LONG"
         elif a2_bias == "SHORT_BASE":
             direction = "SHORT"
-        elif regime == "MR":
-            # In MR, direction comes from A4 technical models
+        else:
+            # A2 neutral — use A4 direction (works for MR, THV, TLV)
             a4_data = self._rget(f"features:analyst4:{pair}") or {}
             a4_dir  = a4_data.get("direction", "FLAT")
             a4_gate = a4_data.get("gate", "FAIL")
-            if a4_gate == "PASS" and a4_dir in ("LONG", "SHORT"):
+            if a4_gate in ("PASS", "PASS_SINGLE") and a4_dir in ("LONG", "SHORT"):
                 direction = a4_dir
             else:
                 return {
                     **dict(NEUTRAL_ENTRY),
                     "regime":    regime,
                     "direction": "FLAT",
-                    "reason":    "MR: A2 neutral + A4 no signal",
+                    "reason":    "A2 NEUTRAL + A4 no signal — no direction to time",
                     "available": True,
                 }
-        else:
-            return {
-                **dict(NEUTRAL_ENTRY),
-                "regime":    regime,
-                "direction": "FLAT",
-                "reason":    "A2 NEUTRAL — no direction to time",
-                "available": True,
-            }
 
         # PNS → always flat regardless
         if regime == "PNS":
@@ -281,6 +291,50 @@ class EntryEngine:
                 "reason":    "PNS regime — no entries allowed",
                 "available": True,
             }
+
+        # ── S/R proximity gate + session breakout ────────────────────────────
+        # Use structural_distance (swing/round/pivot only) — EMA-inclusive
+        # distance_to_resistance is always 0–5 pip (EMAs track price) and
+        # would block all entries every bar.
+        sr_data = self._rget(f"features:sr:{pair}") or {}
+
+        # Session breakout check fires BEFORE S/R gate — a breakout through
+        # resistance IS the trade and must not be blocked by the S/R wall.
+        session_entry = self._score_session_breakout(pair, sr_data, stat_data, flow_data)
+        if session_entry is not None:
+            return session_entry
+
+        if sr_data and direction != "FLAT":
+            dist_res = sr_data.get("structural_distance_to_resistance",
+                                   sr_data.get("distance_to_resistance", 999.0))
+            dist_sup = sr_data.get("structural_distance_to_support",
+                                   sr_data.get("distance_to_support", 999.0))
+
+            if regime == "MR":
+                # In MR, S/R proximity is a TRIGGER — fade the level.
+                # Near resistance → flip to SHORT (fade it down).
+                # Near support    → flip to LONG  (bounce it up).
+                # Both close or neither close → keep original A4 direction.
+                if dist_res < 15.0 and dist_sup > 10.0:
+                    direction = "SHORT"
+                elif dist_sup < 15.0 and dist_res > 10.0:
+                    direction = "LONG"
+            else:
+                # THV / TLV: hard block — don't trade into an S/R wall
+                if direction == "LONG" and dist_res < 15.0:
+                    return {
+                        "entry_score": 0.0, "entry_type": "BLOCKED_SR",
+                        "wait": True, "available": True, "direction": direction,
+                        "regime": regime,
+                        "reason": f"SR_BLOCK: LONG into structural resistance ({dist_res:.1f}pip away)",
+                    }
+                if direction == "SHORT" and dist_sup < 15.0:
+                    return {
+                        "entry_score": 0.0, "entry_type": "BLOCKED_SR",
+                        "wait": True, "available": True, "direction": direction,
+                        "regime": regime,
+                        "reason": f"SR_BLOCK: SHORT into structural support ({dist_sup:.1f}pip away)",
+                    }
 
         # ── Extract features ──────────────────────────────────────────────────
         f = self._extract_features(vwap_data, stat_data, flow_data)
@@ -297,17 +351,153 @@ class EntryEngine:
         else:
             score, entry_type, reason = 0.0, "WAIT", "Unknown regime"
 
-        wait = score < SCORE_EXECUTE
+        # ── Chase penalty — applied after regime score ────────────────────────
+        # Checks if current price is at the extreme of the triggering M15 bar.
+        # Penalises entries where the bar already moved most of its range before
+        # we enter — the primary cause of 50% of CLOSED_SL losses (ENTRY_LEVEL tag).
+        chase_mult, bar_pos, chase_reason = self._get_bar_chase_factor(pair, direction)
+        if chase_mult < 1.0:
+            score = score * chase_mult
+            reason = f"{reason} | {chase_reason}" if reason else chase_reason
+            logger.debug(
+                f"EntryEngine | {pair} chase penalty ×{chase_mult:.2f} "
+                f"(bar_pos={bar_pos:.2f}) → score={score:.3f}"
+            )
+
+        # ── A7 SMC confidence modifier ─────────────────────────────────────────
+        # Boosts or penalises entry_score based on SMC pattern quality.
+        # Applied after regime scoring and chase penalty — pure confidence modifier.
+        smc_mult   = 1.0
+        smc_reason = ""
+        try:
+            from models.analyst7_smc.score import a7_scorer
+            from features.smc_features import smc_engine
+            smc_feats = smc_engine.get_features(pair)
+            if smc_feats:
+                now = datetime.now(timezone.utc)
+                atr_pips = f.get("atr_m15", 0.0) / (0.01 if pair in JPY_PAIRS else 0.0001)
+                adx_val  = stat_data.get("adx", 25.0)
+                bb_val   = f.get("bb_pct", 0.5)
+                session_h = f.get("pvn", 0.0)  # use VWAP proximity as session proxy
+                smc_prob = a7_scorer.predict(
+                    direction=direction,
+                    smc=smc_feats,
+                    atr_pips=atr_pips,
+                    adx=adx_val,
+                    bb_pct=bb_val,
+                    price_vs_session=session_h,
+                    hour=now.hour,
+                    dow=now.weekday(),
+                )
+                smc_mult, smc_reason = a7_scorer.entry_multiplier(smc_prob)
+                if smc_mult != 1.0:
+                    score = score * smc_mult
+                    reason = f"{reason} | {smc_reason}" if reason else smc_reason
+                    logger.debug(
+                        f"EntryEngine | {pair} SMC ×{smc_mult:.2f} "
+                        f"(smc_prob={smc_prob:.2f}) → score={score:.3f}"
+                    )
+        except Exception as exc:
+            logger.debug(f"EntryEngine | {pair} SMC scoring skipped: {exc}")
+
+        exec_threshold = SCORE_EXECUTE_THV if regime == "THV" else SCORE_EXECUTE
+        wait = score < exec_threshold
 
         return {
-            "entry_score": round(score, 4),
-            "entry_type":  entry_type,
-            "wait":        wait,
-            "reason":      reason,
-            "direction":   direction,
-            "regime":      regime,
-            "available":   True,
+            "entry_score":    round(score, 4),
+            "entry_type":     entry_type,
+            "wait":           wait,
+            "reason":         reason,
+            "direction":      direction,
+            "regime":         regime,
+            "available":      True,
+            "bar_position":   round(bar_pos, 2),
+            "chase_penalty":  round(1.0 - chase_mult, 2),
+            "smc_mult":       round(smc_mult, 2),
         }
+
+    def _get_bar_chase_factor(
+        self, pair: str, direction: str
+    ) -> Tuple[float, float, str]:
+        """
+        Compute how far into the triggering M15 bar the current price is.
+
+        entry_position_in_bar:
+          BUY  → 1.0 = price at bar high  (full chase upward)
+          SELL → 1.0 = price at bar low   (full chase downward)
+          < 0.3 = entered early / at pullback (good)
+          > 0.7 = likely chased price
+
+        Returns:
+            (score_multiplier, entry_position, reason_str)
+            score_multiplier: 1.0 (no penalty) | 0.70 (soft) | 0.40 (hard)
+        """
+        try:
+            # Current mid price from tick Redis key
+            raw_tick = self.redis.get(f"tick:{pair}")
+            if not raw_tick:
+                return 1.0, 0.0, ""
+            tick = json.loads(raw_tick)
+            bid  = float(tick.get("bid", 0))
+            ask  = float(tick.get("ask", 0))
+            if bid <= 0 or ask <= 0:
+                return 1.0, 0.0, ""
+            price = (bid + ask) / 2.0
+
+            # Latest closed M15 bar from DB
+            from data_pipeline.storage.timeseries_db import db
+            from sqlalchemy import text
+            with db.connection() as conn:
+                row = conn.execute(text("""
+                    SELECT open, high, low
+                    FROM ohlcv
+                    WHERE symbol    = :sym
+                      AND timeframe = 'M15'
+                      AND time      <= NOW()
+                    ORDER BY time DESC
+                    LIMIT 1
+                """), {"sym": pair}).fetchone()
+
+            if not row:
+                return 1.0, 0.0, ""
+
+            bar_open = float(row.open)
+            bar_high = float(row.high)
+            bar_low  = float(row.low)
+
+            # Normalise JPY ×100 storage
+            if pair in JPY_PAIRS and bar_high > 1000:
+                bar_open /= 100.0
+                bar_high /= 100.0
+                bar_low  /= 100.0
+
+            bar_range = bar_high - bar_low
+            if bar_range == 0:
+                return 1.0, 0.0, ""
+
+            if direction == "LONG":
+                position = (price - bar_low) / bar_range
+            else:
+                position = (bar_high - price) / bar_range
+
+            position = float(max(0.0, min(1.0, position)))
+
+            if position > CHASE_PENALTY_HARD:
+                return 0.40, position, (
+                    f"CHASE_HARD: bar position={position:.2f} "
+                    f"(entered at {position*100:.0f}% of bar in {direction} direction)"
+                )
+            if position > CHASE_PENALTY_SOFT:
+                return 0.70, position, (
+                    f"CHASE_SOFT: bar position={position:.2f} "
+                    f"(entered at {position*100:.0f}% of bar in {direction} direction)"
+                )
+
+            return 1.0, position, ""
+
+        except Exception as exc:
+            logger.warning(f"EntryEngine | _get_bar_chase_factor {pair} failed: {exc}")
+            return 1.0, 0.0, ""
 
     def _extract_features(
         self,
@@ -349,6 +539,10 @@ class EntryEngine:
             "spread_zscore":        flow.get("spread_zscore", 0.0),
             "tick_velocity_1m":     flow.get("tick_velocity_1m", 0.0),
             "velocity_ratio":       flow.get("velocity_ratio", 1.0),
+            # M15 EMA cross — scalp momentum trigger
+            "m15_ema_cross":        stat.get("m15_ema_cross", 0.0),
+            "m15_ema9":             stat.get("m15_ema9", 0.0),
+            "m15_ema21":            stat.get("m15_ema21", 0.0),
         }
 
     @staticmethod
@@ -526,6 +720,27 @@ class EntryEngine:
             score -= 0.05
             reasons.append(f"wide spread ({spread_ratio:.2f}x) — penalty")
 
+        # ── 6. EMA(9/21) cross confirmation (weight: 0.25) ───────────────────
+        # Fresh M15 EMA9/EMA21 cross in the signal direction = momentum trigger.
+        # Opposing cross penalises — don't fight a fresh cross.
+        # Stale or no cross = 0 (neutral, already evaluated via momentum/RSI).
+        ema_cross = f.get("m15_ema_cross", 0.0)
+        ema_score = 0.0
+        if is_long and ema_cross == 1.0:
+            ema_score = 0.25
+            if entry_type == "WAIT":
+                entry_type = "EMA_CROSS"
+            reasons.append("M15 EMA9 crossed above EMA21")
+        elif not is_long and ema_cross == -1.0:
+            ema_score = 0.25
+            if entry_type == "WAIT":
+                entry_type = "EMA_CROSS"
+            reasons.append("M15 EMA9 crossed below EMA21")
+        elif (is_long and ema_cross == -1.0) or (not is_long and ema_cross == 1.0):
+            ema_score = -0.10
+            reasons.append("EMA cross opposing direction — penalty")
+        score += ema_score
+
         # ── THV bonus: higher vol = more momentum conviction ─────────────────
         if regime == "THV" and f["vol_ratio"] > 1.2:
             score += 0.05
@@ -652,6 +867,134 @@ class EntryEngine:
         score = max(0.0, min(1.0, score))
         reason = " | ".join(reasons) if reasons else "No MR extreme found"
         return score, entry_type, reason
+
+    # ── Session breakout scorer ───────────────────────────────────────────────
+
+    def _score_session_breakout(
+        self,
+        pair:      str,
+        sr_data:   Dict,
+        stat_data: Dict,
+        flow_data: Dict,
+    ) -> Optional[Dict]:
+        """
+        Detect London or NY session open breakouts on M15.
+
+        Only fires within the first hour of London open (08:00 UTC) or
+        NY open (13:00 UTC). A confirmed break above the prior session
+        high (or below the low) by at least 1 pip triggers this entry.
+
+        H1 trend alignment adds +0.10. Opposing H1 trend penalises -0.15.
+        Wide spread at open penalises -0.15. Extended breakout (>10 pip)
+        penalises -0.10 to avoid chasing moves already too far gone.
+
+        Returns:
+            Complete entry signal dict when breakout is detected, else None.
+        """
+        now_utc = datetime.now(timezone.utc)
+        hour    = now_utc.hour
+
+        is_london_open = LONDON_OPEN_START <= hour < LONDON_OPEN_END
+        is_ny_open     = NY_OPEN_START     <= hour < NY_OPEN_END
+        if not is_london_open and not is_ny_open:
+            return None
+
+        if not sr_data:
+            return None
+
+        # Get current mid price
+        try:
+            raw_tick = self.redis.get(f"tick:{pair}")
+            if not raw_tick:
+                return None
+            tick  = json.loads(raw_tick)
+            bid   = float(tick.get("bid", 0))
+            ask   = float(tick.get("ask", 0))
+            if bid <= 0 or ask <= 0:
+                return None
+            price = (bid + ask) / 2.0
+            if pair in JPY_PAIRS and price > 1000:
+                price /= 100.0
+        except Exception:
+            return None
+
+        pip = 0.01 if pair in JPY_PAIRS else 0.0001
+
+        # Reference levels: London uses prior Asian session; NY uses current session
+        if is_london_open:
+            level_high = sr_data.get("prev_session_high") or sr_data.get("session_high")
+            level_low  = sr_data.get("prev_session_low")  or sr_data.get("session_low")
+            session    = "LONDON"
+        else:
+            level_high = sr_data.get("session_high")
+            level_low  = sr_data.get("session_low")
+            session    = "NY"
+
+        if not level_high or not level_low:
+            return None
+
+        level_high = float(level_high)
+        level_low  = float(level_low)
+
+        # Require minimum session range to avoid firing on dead/gap opens
+        range_pips = (level_high - level_low) / pip
+        if range_pips < 5.0:
+            return None
+
+        # Check breakout distance
+        min_break = SESSION_BREAKOUT_MIN_PIPS * pip
+        if price > level_high + min_break:
+            direction = "LONG"
+            dist_pips = (price - level_high) / pip
+        elif price < level_low - min_break:
+            direction = "SHORT"
+            dist_pips = (level_low - price) / pip
+        else:
+            return None
+
+        # Base score
+        score   = 0.70
+        reasons = [
+            f"{session}_OPEN {'LONG above high' if direction == 'LONG' else 'SHORT below low'} "
+            f"+{dist_pips:.1f}pip"
+        ]
+
+        # H1 trend alignment
+        h1_trend = float(stat_data.get("h1_trend_dir", 0.0))
+        if (direction == "LONG" and h1_trend > 0) or (direction == "SHORT" and h1_trend < 0):
+            score += 0.10
+            reasons.append("H1 trend aligns")
+        elif (direction == "LONG" and h1_trend < 0) or (direction == "SHORT" and h1_trend > 0):
+            score -= 0.15
+            reasons.append("H1 trend opposing — penalty")
+
+        # Extended breakout guard — past 10 pips the move is likely exhausted
+        if dist_pips > 10.0:
+            score -= 0.10
+            reasons.append(f"extended breakout ({dist_pips:.1f}pip) — partial penalty")
+
+        # Spread health
+        spread_ratio = float(flow_data.get("spread_ratio", 1.0))
+        if spread_ratio > 2.0:
+            score -= 0.15
+            reasons.append(f"wide spread ({spread_ratio:.1f}x) — penalty")
+        else:
+            reasons.append(f"spread normal ({spread_ratio:.2f}x)")
+
+        score = max(0.0, min(1.0, score))
+
+        return {
+            "entry_score":   round(score, 4),
+            "entry_type":    "SESSION_BREAKOUT",
+            "wait":          score < SCORE_EXECUTE,
+            "reason":        " | ".join(reasons),
+            "direction":     direction,
+            "regime":        "SESSION",
+            "available":     True,
+            "bar_position":  0.5,
+            "chase_penalty": 0.0,
+            "smc_mult":      1.0,
+        }
 
     # ── Background scheduler ──────────────────────────────────────────────────
 

@@ -302,8 +302,72 @@ class YieldFeatureEngine:
             base_ccy, quote_ccy, "2Y", yield_hist, window=252
         )
 
+        # ── 7. Real rate differential ─────────────────────────────────────────
+        real_feats = self._compute_real_rate_features(
+            base_ccy, quote_ccy, yields, yield_hist
+        )
+        feats.update(real_feats)
+
         return {k: float(v) if not np.isnan(float(v)) else 0.0
                 for k, v in feats.items()}
+
+    def _compute_real_rate_features(
+        self,
+        base_ccy:   str,
+        quote_ccy:  str,
+        yields:     Dict[str, float],
+        yield_hist: Dict[str, pd.Series],
+    ) -> Dict[str, float]:
+        """
+        Real rate differential = nominal yield diff - inflation diff.
+
+        For USD: uses TIPS yields directly (REAL_2Y / REAL_10Y tenors from FRED).
+        For others: real = nominal - CPI (stored as REAL_10Y / REAL_2Y in DB).
+
+        Real rate diff > nominal diff → inflation is suppressing the quote currency
+        (its nominal yield advantage is partly illusory).
+
+        Returns up to 6 features. Returns empty dict if data unavailable.
+        """
+        feats: Dict[str, float] = {}
+
+        # ── Real 10Y differential ─────────────────────────────────────────────
+        base_real10  = yields.get(f"{base_ccy}_REAL_10Y")
+        quote_real10 = yields.get(f"{quote_ccy}_REAL_10Y")
+
+        if base_real10 is not None and quote_real10 is not None:
+            real_diff_10y = round(base_real10 - quote_real10, 4)
+            feats["real_rate_diff_10Y"]  = real_diff_10y
+            feats["real_rate_score_10Y"] = self._diff_to_score(real_diff_10y)
+
+            # Real rate premium: how much inflation distorts the nominal signal
+            # Positive = base has higher real rate than nominal diff implies
+            nominal_diff_10y = yields.get(f"{base_ccy}_10Y", 0.0) - \
+                               yields.get(f"{quote_ccy}_10Y", 0.0)
+            feats["real_rate_premium"] = round(real_diff_10y - nominal_diff_10y, 4)
+
+            # 4-week momentum on real rate differential
+            base_real_hist  = yield_hist.get(f"{base_ccy}_REAL_10Y")
+            quote_real_hist = yield_hist.get(f"{quote_ccy}_REAL_10Y")
+            if base_real_hist is not None and quote_real_hist is not None:
+                chg_4w, _, momentum = self._compute_diff_trend(
+                    base_ccy, quote_ccy, "REAL_10Y", yield_hist
+                )
+                feats["real_rate_momentum_10Y"] = momentum
+                feats["real_rate_trend_4w_10Y"] = chg_4w
+
+        # ── Real short-term differential ──────────────────────────────────────
+        # USD: REAL_5Y (5Y TIPS — shortest FRED series available)
+        # Others: REAL_2Y (nominal_2Y - CPI, where 2Y yield data exists)
+        base_real_st  = yields.get(f"{base_ccy}_REAL_5Y") or yields.get(f"{base_ccy}_REAL_2Y")
+        quote_real_st = yields.get(f"{quote_ccy}_REAL_5Y") or yields.get(f"{quote_ccy}_REAL_2Y")
+
+        if base_real_st is not None and quote_real_st is not None:
+            real_diff_st = round(base_real_st - quote_real_st, 4)
+            feats["real_rate_diff_2Y"]  = real_diff_st
+            feats["real_rate_score_2Y"] = self._diff_to_score(real_diff_st)
+
+        return feats
 
     def _compute_carry_ranking(
         self, yields: Dict[str, float]
@@ -537,7 +601,7 @@ class YieldFeatureEngine:
                 SELECT date, currency, tenor, yield_pct
                 FROM yield_data
                 WHERE date >= :cutoff
-                  AND tenor IN ('2Y', '10Y', '3M', 'SLOPE')
+                  AND tenor IN ('2Y', '10Y', '3M', 'SLOPE', 'CPI', 'REAL_2Y', 'REAL_5Y', 'REAL_10Y')
                 ORDER BY currency, tenor, date
             """), {"cutoff": cutoff})
             rows = result.fetchall()

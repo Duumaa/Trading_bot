@@ -28,6 +28,7 @@ Pull commands (you type in Telegram, bot replies):
     /price     — live bid/ask/spread for all 12 pairs
     /pause     — halt new trade execution
     /resume    — resume trade execution
+    /restart   — graceful restart via SIGTERM → systemd auto-restart
     /help      — command list
 
 Usage:
@@ -40,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import threading
 import time
 from datetime import datetime, timezone
@@ -54,7 +56,8 @@ load_dotenv("/workspaces/Trading_bot/.env")
 
 # ──────────────────────────────────────────────────────────────────
 PAIRS = [
-    "EURUSD", "GBPUSD", "USDJPY", "USDCHF",
+    "EURUSD", "GBPUSD", "USDJPY",
+    # "USDCHF" — SUSPENDED: SNB intervention risk, no signal_aggregator coverage
     "AUDUSD", "NZDUSD", "USDCAD", "EURGBP",
     "EURJPY", "GBPJPY", "AUDJPY", "NZDJPY",
 ]
@@ -248,6 +251,9 @@ class TelegramAlerts:
             "/price":     self._cmd_price,
             "/pause":     self._cmd_pause,
             "/resume":    self._cmd_resume,
+            "/restart":   self._cmd_restart,
+            "/postmortem":   self._cmd_postmortem,
+            "/apex":      self._cmd_apex,
         }
 
         handler = handlers.get(cmd)
@@ -285,6 +291,9 @@ class TelegramAlerts:
             "/price — Live bid/ask for all pairs\n"
             "/pause — Halt new trades\n"
             "/resume — Resume trading\n"
+            "/restart — Restart bot service\n"
+            "/postmortem — Weekly loss analysis\n"
+            "/apex — APEX penalty rules status\n"
             "/help — This menu"
         )
 
@@ -321,7 +330,7 @@ class TelegramAlerts:
             act  = sig.get("action", "FLAT")
             conf = sig.get("confidence", 0.0)
             reg  = sig.get("regime", "???")
-            size = sig.get("size_multiplier", 1.0)
+            size = sig.get("size_mult", sig.get("size_multiplier", 1.0))  # fix key name
             g1   = sig.get("gate1", "?")[:12]
             g2   = sig.get("gate2", "?")[:12]
             g3   = sig.get("gate3", "?")[:28]
@@ -330,20 +339,53 @@ class TelegramAlerts:
             de   = DIR_EMOJI.get(act, "⬜")
             re   = REGIME_EMOJI.get(reg, "")
 
+            # HMM indicator: show when HMM disagrees with A1
+            hmm_reg  = sig.get("hmm_regime", "")
+            gate1b   = sig.get("gate1b", "")
+            hmm_tag  = ""
+            if "HMM_UPGRADE" in gate1b and hmm_reg:
+                hmm_tag = f"🔮{hmm_reg}"   # HMM saw trend A1 missed
+            elif "A1_LEADS" in gate1b and hmm_reg:
+                hmm_tag = f"⚡{hmm_reg}"   # A1 saw trend HMM missed
+
+            path  = sig.get("path", "FUNDAMENTAL")
+            is_tc = path == "TECH_CONFLUENCE"
+
             if act in ("LONG", "SHORT"):
+                hmm_str = f"  {hmm_tag}" if hmm_tag else ""
+                if is_tc:
+                    d1s = sig.get("gate1", "")
+                    h1s = sig.get("gate2", "")
+                    lines.append(
+                        f"{de} <b>{pair}</b>  conf=<b>{conf:.2f}</b>  {re}{reg}  {size:.2f}x  🔵<b>TC</b>{hmm_str}\n"
+                        f"   {d1s[:24]}  {h1s[:24]}\n"
+                        f"   A4:{g3[:28]}\n"
+                        f"   Entry:{g4[:20]}"
+                    )
+                else:
+                    lines.append(
+                        f"{de} <b>{pair}</b>  conf=<b>{conf:.2f}</b>  {re}{reg}  {size:.2f}x{hmm_str}\n"
+                        f"   G1:{g1}  G2:{g2}\n"
+                        f"   G3-ML:{g3}\n"
+                        f"   G4:{g4}  A2={a2s:.3f}"
+                    )
+            elif sig.get("reason") == "HEDGE_ACTIVE":
+                hedge = self._rget(f"hedge:active:{pair}") or {}
+                cycles  = hedge.get("cycle_count", 0)
+                banked  = hedge.get("realized_pnl", 0.0)
+                status  = hedge.get("status", "ACTIVE")
                 lines.append(
-                    f"{de} <b>{pair}</b>  conf=<b>{conf:.2f}</b>  {re}{reg}  {size}x\n"
-                    f"   G1:{g1}  G2:{g2}\n"
-                    f"   G3-ML:{g3}\n"
-                    f"   G4:{g4}  A2={a2s:.3f}"
+                    f"🔀 <b>{pair}</b>  ↔️MR  🔁HEDGE [{status}]  "
+                    f"cycles={cycles}  banked=${banked:+.2f}"
                 )
             else:
-                # FLAT — show why it was blocked
+                # FLAT — show why it was blocked + HMM tag if relevant
                 block = g1 if not g1.startswith("PASS") else (
                         g2 if not g2.startswith("PASS") else (
                         g3 if not g3.startswith("PASS") else g4))
+                hmm_str = f"|{hmm_tag}" if hmm_tag else ""
                 lines.append(
-                    f"{de} <b>{pair}</b>  {re}{reg}  ✗{block}"
+                    f"{de} <b>{pair}</b>  {re}{reg}  ✗{block}{hmm_str}"
                 )
         self._reply("\n".join(lines))
 
@@ -410,7 +452,7 @@ class TelegramAlerts:
         try:
             _r = _redis.Redis(host="localhost", port=6379,
                 password=_os.getenv("REDIS_PASSWORD"), decode_responses=True)
-            pairs = ["EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","NZDUSD",
+            pairs = ["EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD",
                      "USDCAD","EURGBP","EURJPY","GBPJPY","AUDJPY","NZDJPY"]
             positions = {}
             for p in pairs:
@@ -635,6 +677,38 @@ class TelegramAlerts:
         self._paused = False
         logger.info("TelegramAlerts | Trading RESUMED via Telegram command")
         self._reply("▶️ <b>Trading RESUMED</b>\nNew signals will be executed normally.")
+
+    def _cmd_restart(self, _: str) -> None:
+        """Gracefully restart the bot via SIGTERM → systemd auto-restart."""
+        logger.warning("TelegramAlerts | Restart requested via Telegram")
+        self._reply(
+            "🔄 <b>Restarting bot...</b>\n\n"
+            "Sending graceful shutdown signal.\n"
+            "systemd will restart the service automatically.\n"
+            "Bot will be back online in ~15 seconds."
+        )
+        # Small delay so the reply is sent before the process exits
+        threading.Timer(2.0, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+
+    def _cmd_postmortem(self, _: str) -> None:
+        """Send weekly postmortem loss analysis summary."""
+        self._reply("🔍 Generating postmortem report...")
+        try:
+            from intelligence.postmortem_analyzer import postmortem_analyzer
+            msg = postmortem_analyzer.weekly_summary(days_back=7)
+            self._reply(msg)
+        except Exception as exc:
+            logger.error(f"TelegramAlerts | /postmortem failed: {exc}")
+            self._reply(f"⚠️ Postmortem failed: {exc}")
+
+    def _cmd_apex(self, _: str) -> None:
+        """Show APEX framework status and active penalty rules."""
+        try:
+            from intelligence.apex_framework import apex_framework
+            self._reply(apex_framework.get_summary_text())
+        except Exception as exc:
+            logger.error(f"TelegramAlerts | /apex failed: {exc}")
+            self._reply(f"⚠️ APEX status failed: {exc}")
 
     # ══════════════════════════════════════════════════════════════
     # PUSH ALERT METHODS (called from main_loop / executors)

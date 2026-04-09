@@ -82,6 +82,8 @@ SENTIMENT_HOURS      = 4       # Groq sentiment refresh interval
 POSITION_SYNC_BARS   = 4       # sync positions every N bars (1h)
 DAILY_SNAPSHOT_HOUR  = 23      # UTC hour for daily snapshot
 DAILY_SNAPSHOT_MIN   = 50
+WEEKLY_POSTMORTEM_DAY  = 0     # Monday
+WEEKLY_POSTMORTEM_HOUR = 8     # 08:00 UTC
 
 # Market session hours (UTC)
 SYDNEY_OPEN   = 21   # Sunday 21:00 UTC
@@ -101,9 +103,9 @@ def _is_market_open() -> bool:
     Closed windows:
       - Saturday all day
       - Sunday before 21:00 UTC (market closed)
-      - Sunday 21:00 → Monday 23:30 UTC (thin liquidity blackout)
+      - Sunday 21:00 → Monday 02:00 UTC (thin liquidity blackout)
         → Asian open gap window: wide spreads, FIX drops, SL hunts
-        → In Mongolia time: market opens 06:00 Mon but bot waits until 07:30
+        → In Mongolia time: bot resumes 10:00 Mon (02:00 UTC)
       - Any day 21:00 → 22:00 UTC (daily rollover / session transition)
         → Spreads widen briefly during broker rollover
     """
@@ -120,12 +122,10 @@ def _is_market_open() -> bool:
     if weekday == 6:
         return False
 
-    # Monday before 23:30 UTC — thin liquidity blackout
+    # Monday before 02:00 UTC — thin liquidity blackout
     # FIX collector drops connections, spreads wide, VWAP stale
-    # Mongolia time: 06:00-07:30 Mon = 22:00 Sun - 23:30 Mon UTC
-    if weekday == 0 and hour == 7 and minute < 30:
-        return False
-    if weekday == 0 and hour < 7:
+    # Mongolia time: 10:00 Mon = 02:00 UTC
+    if weekday == 0 and hour < 2:
         return False
 
     # Daily rollover blackout — 21:00-22:00 UTC every day
@@ -199,6 +199,7 @@ def _startup_features() -> bool:
         ("event",       "features.event_features",       "event_engine"),
         ("orderflow",   "features.orderflow_features",   "flow_engine"),
         ("liquidity",   "features.liquidity_features",   "liq_engine"),
+        ("smc",         "features.smc_features",         "smc_engine"),
     ]
 
     for name, module_path, singleton_name in engines:
@@ -229,13 +230,21 @@ def _startup_analysts() -> bool:
     except Exception as exc:
         logger.warning(f"MainLoop | Analyst 2 startup failed: {exc}")
 
-    # Analyst 1 — regime classifier
+    # Analyst 1 — regime classifier (LightGBM)
     try:
         from models.analyst1_regime.regime_classifier import regime_classifier
         regime_classifier.compute_all()
-        logger.success("MainLoop | Analyst 1 (Regime) ready")
+        logger.success("MainLoop | Analyst 1 (Regime LightGBM) ready")
     except Exception as exc:
         logger.warning(f"MainLoop | Analyst 1 startup failed: {exc}")
+
+    # Analyst 1 HMM — parallel regime classifier
+    try:
+        from models.analyst1_hmm.hmm_regime_classifier import hmm_regime_classifier
+        hmm_regime_classifier.compute_all()
+        logger.success("MainLoop | Analyst 1 HMM ready")
+    except Exception as exc:
+        logger.warning(f"MainLoop | Analyst 1 HMM startup failed: {exc}")
 
     # Analyst 6 — Opus weekly (run if no cached analysis)
     try:
@@ -364,12 +373,17 @@ def _process_bar(
     # 2. Refresh fast features
     _refresh_fast_features()
 
-    # 3. Run regime classifier
+    # 3. Run regime classifiers (LightGBM + HMM in parallel)
     try:
         from models.analyst1_regime.regime_classifier import regime_classifier
         regime_classifier.compute_all()
     except Exception as exc:
-        logger.warning(f"MainLoop | Regime compute failed: {exc}")
+        logger.warning(f"MainLoop | Regime (LightGBM) compute failed: {exc}")
+    try:
+        from models.analyst1_hmm.hmm_regime_classifier import hmm_regime_classifier
+        hmm_regime_classifier.compute_all()
+    except Exception as exc:
+        logger.warning(f"MainLoop | Regime (HMM) compute failed: {exc}")
 
     # 4. Evaluate signals
     try:
@@ -390,7 +404,7 @@ def _process_bar(
         logger.error(f"MainLoop | Signal evaluation failed: {exc}")
         return results
 
-    # 4b. Technical invalidation check on open positions
+    # 4b. Technical invalidation check on open positions (skips hedge legs)
     try:
         from execution.technical_exit_monitor import tech_exit_monitor
         exit_actions = tech_exit_monitor.run_checks()
@@ -399,6 +413,18 @@ def _process_bar(
             logger.warning(f"MainLoop | TechExit closed positions: {closed}")
     except Exception as exc:
         logger.error(f"MainLoop | Technical exit monitor failed: {exc}")
+
+    # 4c. Hedge manager: DISABLED 2026-04-03 — backtest confirms unprofitable
+    # (avg 1.1 cycles vs 3+ needed; WINNER_RUNNING fires too early, kills every trade)
+    # To re-enable: uncomment the block below and add hedge-monitor back to threads list
+    # if not dry_run:
+    #     try:
+    #         from execution.hedge_manager import hedge_manager
+    #         from execution.signal_aggregator import PAIRS as _PAIRS
+    #         for _pair in _PAIRS:
+    #             hedge_manager.consider_opening(_pair)
+    #     except Exception as exc:
+    #         logger.error(f"MainLoop | Hedge manager failed: {exc}")
 
     # 5. Execute signals
     if not dry_run and tradeable:
@@ -648,6 +674,26 @@ def _start_background_threads(dry_run: bool) -> None:
             try:
                 from execution.risk_manager import risk_manager
                 risk_manager.take_daily_snapshot()
+
+                # Refresh D1 + H1 bars daily so retraining data stays current
+                try:
+                    from data_pipeline.connectors.ctrader_rest_api import connector
+                    connector.get_all_pairs_historical(timeframe="D1", days_back=3, store_to_db=True)
+                    connector.get_all_pairs_historical(timeframe="H1", days_back=3, store_to_db=True)
+                    logger.success("MainLoop | D1+H1 bars refreshed")
+                except Exception as _bar_exc:
+                    logger.warning(f"MainLoop | D1+H1 refresh failed: {_bar_exc}")
+
+                # Weekly postmortem summary — every Monday 08:00 UTC
+                if now.weekday() == 0 and now.hour == 8:
+                    try:
+                        from intelligence.postmortem_analyzer import postmortem_analyzer
+                        from intelligence.monitoring.telegram_alerts import alerts
+                        summary = postmortem_analyzer.weekly_summary(days_back=7)
+                        alerts.send_message(summary)
+                        logger.info("MainLoop | Weekly postmortem summary sent to Telegram")
+                    except Exception as _pm_exc:
+                        logger.warning(f"MainLoop | Weekly postmortem failed: {_pm_exc}")
                 risk_manager.account.reset_daily()
                 logger.success("MainLoop | Daily snapshot taken + P&L reset")
 
@@ -700,14 +746,35 @@ def _start_background_threads(dry_run: bool) -> None:
             except Exception as exc:
                 logger.warning(f"MainLoop | COT update failed: {exc}")
 
+    # ── Postmortem deferred pickup (every hour) ───────────────
+    def _postmortem_pickup_thread():
+        """
+        Pick up CLOSED_SL trades that were deferred at close time because
+        < 4h of post-SL price action data was available. Runs every hour
+        and calls analyze_all_unanalyzed() which now filters for exit_time
+        older than 4h — so fresh losses are never touched prematurely.
+        """
+        logger.info("MainLoop | Postmortem pickup thread started")
+        time.sleep(300)  # 5-min startup grace
+        while True:
+            try:
+                from intelligence.postmortem_analyzer import postmortem_analyzer
+                count = postmortem_analyzer.analyze_all_unanalyzed(status_filter="CLOSED_SL")
+                if count > 0:
+                    logger.success(f"MainLoop | Postmortem pickup: analyzed {count} deferred trades")
+            except Exception as exc:
+                logger.warning(f"MainLoop | Postmortem pickup failed: {exc}")
+            time.sleep(3600)  # run every hour
+
     # Start all threads as daemons
     threads = [
-        ("data-pipeline",  _data_pipeline_thread),
-        ("sentiment",      _sentiment_thread),
-        ("analyst2",       _analyst2_thread),
-        ("opus",           _opus_thread),
-        ("daily-snapshot", _daily_thread),
-        ("cot-weekly",     _cot_thread),
+        ("data-pipeline",       _data_pipeline_thread),
+        ("sentiment",           _sentiment_thread),
+        ("analyst2",            _analyst2_thread),
+        ("opus",                _opus_thread),
+        ("daily-snapshot",      _daily_thread),
+        ("cot-weekly",          _cot_thread),
+        ("postmortem-pickup",   _postmortem_pickup_thread),
     ]
 
     # ── Feature schedulers (every 5–15 min) ──────────────────
@@ -732,6 +799,26 @@ def _start_background_threads(dry_run: bool) -> None:
         except Exception as exc:
             logger.warning(f"MainLoop | flow scheduler: {exc}")
         try:
+            from features.liquidity_features import liq_engine
+            liq_engine.start_scheduler()
+            logger.info("MainLoop | liq_engine scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | liq scheduler: {exc}")
+        try:
+            # S/R must start before entry_engine so cache is warm on first entry eval
+            from features.sr_features import sr_engine
+            sr_engine.start_scheduler()
+            logger.info("MainLoop | sr_engine scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | sr scheduler: {exc}")
+        try:
+            # SMC features refresh every 15 min (same as entry_engine)
+            from features.smc_features import smc_engine
+            smc_engine.start_scheduler()
+            logger.info("MainLoop | smc_engine scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | smc scheduler: {exc}")
+        try:
             from features.entry_engine import entry_engine
             entry_engine.start_scheduler()
             logger.info("MainLoop | entry_engine scheduler started")
@@ -744,17 +831,19 @@ def _start_background_threads(dry_run: bool) -> None:
         except Exception as exc:
             logger.warning(f"MainLoop | trailing stop: {exc}")
         try:
-            from features.liquidity_features import liq_engine
-            liq_engine.start_scheduler()
-            logger.info("MainLoop | liq_engine scheduler started")
-        except Exception as exc:
-            logger.warning(f"MainLoop | liq scheduler: {exc}")
-        try:
             from features.analyst4_inference import analyst4
             analyst4.start_scheduler()
             logger.info("MainLoop | analyst4 scheduler started")
         except Exception as exc:
             logger.warning(f"MainLoop | analyst4 scheduler: {exc}")
+
+        try:
+            from intelligence.apex_framework import apex_framework
+            apex_framework.start_scheduler()
+            logger.info("MainLoop | APEX framework scheduler started")
+        except Exception as exc:
+            logger.warning(f"MainLoop | APEX scheduler: {exc}")
+
         # Thread stays alive so daemon doesn't get GC'd
         while True:
             time.sleep(3600)
@@ -820,6 +909,35 @@ def _start_background_threads(dry_run: bool) -> None:
 
             time.sleep(300)  # check every 5 minutes
 
+    def _hedge_monitor_thread():
+        """
+        Two-tier hedge monitoring:
+          - Every 30s: liveness check (DB read only, zero API calls)
+                       Detects SL hits and PARTIAL states fast.
+          - Every 60s: full check_all() — S/R cycling + regime conversion.
+                       Uses current tick price from Redis (not M15 bar).
+        """
+        from execution.hedge_manager import hedge_manager
+        logger.info("MainLoop | Hedge monitor thread started (30s liveness / 60s cycle)")
+        last_full_check = 0.0
+
+        while True:
+            try:
+                now = time.monotonic()
+
+                # Full cycle check every 60s
+                if now - last_full_check >= 60:
+                    hedge_manager.check_all()
+                    last_full_check = now
+                else:
+                    # Liveness-only check every 30s
+                    hedge_manager.check_liveness_all()
+
+            except Exception as exc:
+                logger.error(f"MainLoop | Hedge monitor error: {exc}")
+
+            time.sleep(30)
+
     threads = [
         ("data-pipeline",      _data_pipeline_thread),
         ("sentiment",          _sentiment_thread),
@@ -828,7 +946,8 @@ def _start_background_threads(dry_run: bool) -> None:
         ("daily-snapshot",     _daily_thread),
         ("cot-weekly",         _cot_thread),
         ("feature-schedulers", _feature_scheduler_thread),
-        #("tick-watchdog",      _tick_watchdog_thread),   # ← NEW
+        #("hedge-monitor",      _hedge_monitor_thread),  # DISABLED 2026-04-03
+        #("tick-watchdog",      _tick_watchdog_thread),
     ]
     # Stream thread only when market open
     # Stream thread only when market open
@@ -979,6 +1098,12 @@ def main(dry_run: bool = False, status_only: bool = False) -> None:
                     f"MainLoop | Startup reconcile: zombie trade {tid} "
                     f"{sym} → {close_status} @ {exit_price}"
                 )
+                if close_status == "CLOSED_SL":
+                    try:
+                        from intelligence.postmortem_analyzer import postmortem_analyzer
+                        postmortem_analyzer.analyze_trade(tid)
+                    except Exception as _pm_exc:
+                        logger.debug(f"MainLoop | Postmortem skipped: {_pm_exc}")
                 zombies += 1
 
         if zombies:
@@ -988,6 +1113,17 @@ def main(dry_run: bool = False, status_only: bool = False) -> None:
             )
         else:
             logger.success("MainLoop | Startup reconcile: DB in sync with cTrader ✅")
+
+        # ── Reverse check: cTrader positions not tracked in DB ───────────────
+        db_pos_ids = {str(row[6]) for row in db_open if row[6]}
+        untracked = [p for p in live_positions if str(p["position_id"]) not in db_pos_ids]
+        if untracked:
+            for p in untracked:
+                logger.warning(
+                    f"MainLoop | Startup reconcile: UNTRACKED cTrader position "
+                    f"pos_id={p['position_id']} dir={p.get('direction')} "
+                    f"entry={p.get('entry_price')} — no DB record (DB insert failure?)"
+                )
 
     except Exception as exc:
         logger.warning(f"MainLoop | Startup reconcile failed: {exc}")

@@ -510,11 +510,36 @@ class OrderExecutor:
             return {"success": False, "error": str(exc)}
 
         if not result["success"]:
-            logger.error(f"OrderExecutor | Close rejected: {result.get('error')}")
-            return result
+            # cTrader sometimes sends INVALID_REQUEST but still closes the position
+            # (execution events confirm the close ~200ms later).
+            # Retry: if retry returns POSITION_NOT_FOUND the first close worked.
+            if "INVALID_REQUEST" in result.get("error", ""):
+                import time as _t
+                _t.sleep(0.5)
+                retry_req = ProtoOAClosePositionReq()
+                retry_req.ctidTraderAccountId = self._account_id
+                retry_req.positionId          = int(position_id)
+                retry_req.volume              = volume * 100
+                retry_resp   = self.connector._send_request(retry_req)
+                retry_result = _parse_order_response(retry_resp, pair)
+                if not retry_result.get("success") and "POSITION_NOT_FOUND" in retry_result.get("error", ""):
+                    logger.info(
+                        f"OrderExecutor | {pair} close confirmed via retry "
+                        f"(cTrader INVALID_REQUEST + POSITION_NOT_FOUND pattern)"
+                    )
+                    result = {"success": True, "fill_price": 0.0}   # fill_price filled below
+                else:
+                    logger.error(f"OrderExecutor | Close rejected: {result.get('error')}")
+                    return result
+            else:
+                logger.error(f"OrderExecutor | Close rejected: {result.get('error')}")
+                return result
 
         fill_price = result.get("fill_price", 0.0)
-        if fill_price == 0.0:
+        if fill_price < 0.1:
+            # Catches both 0.0 (missing) and corrupt tiny values produced when
+            # cTrader returns executionPrice as a raw float instead of the
+            # expected integer (e.g. 1.3236 → divided by 100000 → 1.32e-05).
             from execution.risk_manager import _get_current_price
             fill_price = _get_current_price(pair)
 
@@ -526,6 +551,12 @@ class OrderExecutor:
         pnl = None
         if trade_id:
             pnl = risk_manager.record_trade_close(trade_id, fill_price, reason)
+            if reason in ("CLOSED_SL", "CLOSED_TECH_FLIP"):
+                try:
+                    from intelligence.postmortem_analyzer import postmortem_analyzer
+                    postmortem_analyzer.analyze_trade(trade_id)
+                except Exception as _pm_exc:
+                    logger.debug(f"OrderExecutor | Postmortem skipped: {_pm_exc}")
 
         # Remove from Redis
         try:
@@ -691,6 +722,12 @@ class OrderExecutor:
                                     f"{trade_db_id} {pair} closed @ {sl_price} "
                                     f"[{close_status}]"
                                 )
+                                if close_status == "CLOSED_SL":
+                                    try:
+                                        from intelligence.postmortem_analyzer import postmortem_analyzer
+                                        postmortem_analyzer.analyze_trade(trade_db_id)
+                                    except Exception as _pm_exc:
+                                        logger.debug(f"OrderExecutor | Postmortem skipped: {_pm_exc}")
                     except Exception as e:
                         logger.warning(f"OrderExecutor | Reconcile DB close failed: {e}")
                     removed += 1
@@ -717,32 +754,56 @@ class OrderExecutor:
                 for row in db_open:
                     tid, sym, dirn, entry, sl, tp, ct_pos_id = row
                     if ct_pos_id and str(ct_pos_id) not in live_pos_ids:
-                        # Position gone from cTrader — determine exit price
-                        # Use SL as conservative exit (worst case)
-                        # TP check: if price moved past TP direction → TP hit
-                        from execution.risk_manager import _get_current_price
-                        current = _get_current_price(sym)
+                        # Position gone from cTrader — fetch actual close price
+                        # from deal history instead of guessing from current price
+                        # Guessing caused wrong CLOSED_SL on profitable trades
+                        exit_price   = None
+                        close_status = "CLOSED_SL"  # safe default
 
-                        if dirn == "BUY":
-                            if tp and current >= tp:
-                                exit_price   = tp
-                                close_status = "CLOSED_TP"
+                        try:
+                            actual = self._get_closed_deal_price(
+                                str(ct_pos_id), sym
+                            )
+                            if actual:
+                                exit_price = actual
+                                # Determine status from actual exit vs SL/TP
+                                pip_size = 0.01 if sym in {
+                                    "USDJPY","EURJPY","GBPJPY","AUDJPY","NZDJPY"
+                                } else 0.0001
+                                if dirn == "BUY":
+                                    pips = (exit_price - entry) / pip_size
+                                else:
+                                    pips = (entry - exit_price) / pip_size
+
+                                if pips >= 0:
+                                    close_status = "CLOSED_TP"
+                                elif tp and dirn == "BUY" and exit_price >= tp * 0.999:
+                                    close_status = "CLOSED_TP"
+                                elif tp and dirn == "SELL" and exit_price <= tp * 1.001:
+                                    close_status = "CLOSED_TP"
+                                else:
+                                    close_status = "CLOSED_SL"
+                        except Exception as _de:
+                            logger.debug(f"OrderExecutor | Deal fetch failed: {_de}")
+
+                        # Fallback — if deal fetch failed use SL price
+                        if exit_price is None:
+                            if dirn == "BUY":
+                                exit_price = sl
                             else:
-                                exit_price   = sl
-                                close_status = "CLOSED_SL"
-                        else:  # SELL
-                            if tp and current <= tp:
-                                exit_price   = tp
-                                close_status = "CLOSED_TP"
-                            else:
-                                exit_price   = sl
-                                close_status = "CLOSED_SL"
+                                exit_price = sl
 
                         risk_manager.record_trade_close(tid, exit_price, close_status)
                         logger.warning(
                             f"OrderExecutor | DB zombie fixed: "
                             f"trade {tid} {sym} → {close_status} @ {exit_price}"
                         )
+                        if close_status in ("CLOSED_SL", "CLOSED_TECH_FLIP"):
+                            try:
+                                from intelligence.postmortem_analyzer import postmortem_analyzer
+                                postmortem_analyzer.analyze_trade(tid)
+                            except Exception as _pm_exc:
+                                logger.debug(f"OrderExecutor | Postmortem skipped: {_pm_exc}")
 
             except Exception as exc:
                 logger.warning(f"OrderExecutor | DB reconcile failed: {exc}")
@@ -809,6 +870,14 @@ class OrderExecutor:
             )
             return None
 
+        # Apply correlation guard size override (3rd correlated entry at 0.25x)
+        corr_size_override = check.get("size_mult_override", 1.0)
+        if corr_size_override < 1.0:
+            size_mult = min(size_mult, corr_size_override)
+            logger.info(
+                f"OrderExecutor | {pair} CORR_OVERRIDE: size capped at {size_mult}x"
+            )
+
         # Calculate position
         entry_price = _get_current_price(pair)
         sizing      = risk_manager.calculate_position(
@@ -838,6 +907,8 @@ class OrderExecutor:
             "tsmixer":     decision.get("a4_conf") or _a4_conf,
             "sentiment":   decision.get("sent_score", 0.0),
             "opus_conv":   decision.get("opus_conv", 0.0),
+            "path":        decision.get("path", "GATE_1234"),
+            "entry_type":  decision.get("entry_type", ""),
         }
 
         # Place order
@@ -862,6 +933,77 @@ class OrderExecutor:
         return result
 
     # ── Internal helpers ──────────────────────────────────────
+    def _get_closed_deal_price(
+        self, position_id: str, symbol: str
+    ) -> Optional[float]:
+        """
+        Fetch actual closing price for a position from Redis tick history.
+
+        Used by zombie reconcile to get real exit price instead of
+        guessing from current market price — which caused profitable
+        trades to be recorded as CLOSED_SL incorrectly.
+
+        Strategy:
+          1. Check Redis tick:{symbol} for last known price near close time
+          2. Check DB ticks table for last tick before position disappeared
+          3. Return None if no reliable price found → caller uses SL fallback
+
+        Args:
+            position_id: cTrader position ID string
+            symbol:      Currency pair e.g. 'AUDJPY'
+
+        Returns:
+            Closing price float or None if unavailable
+        """
+        # Source 1 — latest tick from Redis (most recent price)
+        try:
+            val = self.r.get(f"tick:{symbol}")
+            if val:
+                tick = json.loads(val)
+                price = float(tick.get("bid", 0) or tick.get("price", 0))
+                if price > 0:
+                    # Descale JPY pairs if stored as price×100
+                    jpy = {"USDJPY","EURJPY","GBPJPY","AUDJPY","NZDJPY"}
+                    if symbol in jpy and price > 1000:
+                        price /= 100.0
+                    logger.debug(
+                        f"OrderExecutor | _get_closed_deal_price "
+                        f"{symbol} from tick Redis: {price}"
+                    )
+                    return price
+        except Exception as exc:
+            logger.debug(f"OrderExecutor | tick Redis failed {symbol}: {exc}")
+
+        # Source 2 — latest tick from DB (reliable but slower)
+        try:
+            from data_pipeline.storage.timeseries_db import db
+            from sqlalchemy import text as sa_text
+            with db.connection() as conn:
+                row = conn.execute(sa_text("""
+                    SELECT bid FROM ticks
+                    WHERE symbol = :sym
+                      AND time > NOW() - INTERVAL '10 minutes'
+                    ORDER BY time DESC LIMIT 1
+                """), {"sym": symbol}).fetchone()
+            if row:
+                price = float(row[0])
+                jpy = {"USDJPY","EURJPY","GBPJPY","AUDJPY","NZDJPY"}
+                if symbol in jpy and price > 1000:
+                    price /= 100.0
+                if price > 0:
+                    logger.debug(
+                        f"OrderExecutor | _get_closed_deal_price "
+                        f"{symbol} from ticks DB: {price}"
+                    )
+                    return price
+        except Exception as exc:
+            logger.debug(f"OrderExecutor | ticks DB failed {symbol}: {exc}")
+
+        logger.warning(
+            f"OrderExecutor | _get_closed_deal_price {symbol} "
+            f"— no price source found, caller will use SL fallback"
+        )
+        return None
 
     def _get_cached_position(self, pair: str) -> Optional[Dict]:
         """Get cached position data from Redis."""
@@ -952,7 +1094,7 @@ if __name__ == "__main__":
         print(f"    Volume:  {sizing['volume_units']:,} units")
         print(f"    Entry:   ~{entry:.5f}")
         print(f"    SL:      {sizing['stop_loss']:.5f} ({sizing['stop_pips']:.1f} pips)")
-        print(f"    TP:      {sizing['take_profit']:.5f}")
+        print(f"    TP:      {sizing['take_profit']:.5f} [{sizing.get('tp_source','?')}] R={sizing.get('r_ratio', 0):.2f}")
         print(f"    Risk:    ${sizing['risk_amount_usd']:.2f}")
         print(f"    Regime:  {regime} size={size_mult}x")
 

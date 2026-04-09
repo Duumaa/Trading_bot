@@ -420,8 +420,45 @@ def _score_yield(pair: str, base: str, quote: str) -> Tuple[float, bool]:
     slope_diff  = feats.get("curve_slope_diff", 0.0)
     slope_score = np.clip(slope_diff * 2.0, -0.20, 0.20)
 
-    # ── Final composite ───────────────────────────────────────
-    yield_score  = tenor_2y * 0.40 + tenor_10y * 0.60
+    # ── Real rate differential (40% blend when available) ─────────────────────
+    # Real rate = nominal yield − inflation. Capital responds to real returns,
+    # not nominal. 5% yield with 4% inflation = 1% real return.
+    real_diff_10y  = feats.get("real_rate_diff_10Y")
+    real_score_10y = feats.get("real_rate_score_10Y")
+    real_diff_2y   = feats.get("real_rate_diff_2Y")
+    real_score_2y  = feats.get("real_rate_score_2Y")
+    real_premium   = feats.get("real_rate_premium", 0.0)
+    real_momentum  = feats.get("real_rate_momentum_10Y", 0.0)
+
+    if real_diff_10y is not None and real_score_10y is not None:
+        nonlin_real10 = _nonlinear_scale(real_diff_10y * 100.0, YIELD_EXTREME_BPS)
+        real_10y_base = float(np.clip(
+            real_score_10y * 0.50 + nonlin_real10 * 0.50 +
+            np.sign(real_momentum) * 0.40 * 0.40,
+            -1.0, 1.0
+        ))
+        if real_diff_2y is not None and real_score_2y is not None:
+            nonlin_real2  = _nonlinear_scale(real_diff_2y * 100.0, YIELD_EXTREME_BPS)
+            real_2y_base  = float(np.clip(
+                real_score_2y * 0.50 + nonlin_real2 * 0.50, -1.0, 1.0
+            ))
+            real_rate_score = real_2y_base * 0.40 + real_10y_base * 0.60
+        else:
+            real_rate_score = real_10y_base
+
+        nominal_yield_score = tenor_2y * 0.40 + tenor_10y * 0.60
+        yield_score = nominal_yield_score * 0.60 + real_rate_score * 0.40
+
+        # Conviction cut when real and nominal signals diverge materially
+        if abs(real_premium) > 0.5 and np.sign(real_rate_score) != np.sign(nominal_yield_score):
+            yield_score *= 0.65
+            logger.debug(
+                f"Analyst2 | {pair}: real/nominal diverge "
+                f"(premium={real_premium:+.2f}) → conviction −35%"
+            )
+    else:
+        yield_score = tenor_2y * 0.40 + tenor_10y * 0.60
+
     yield_score += cip_score * 0.05 + slope_score * 0.05
     yield_score  = float(np.clip(yield_score, -1.0, 1.0))
 
